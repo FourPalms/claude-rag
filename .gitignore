@@ -1,0 +1,36 @@
+# Vector database storage
+chroma_db/
+chroma_db.backup/
+qdrant_db/
+qdrant_storage/
+qdrant_data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Test outputs
+results/
+
+# Project notes
+.todo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config (use config.example.py as template)
+config.py
+
+# Logs
+logs/
