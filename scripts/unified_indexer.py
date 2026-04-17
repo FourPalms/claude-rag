@@ -14,10 +14,30 @@ Coming soon:
 
 import sys
 import time
+import uuid
+import hashlib
 import argparse
 from pathlib import Path
 from typing import List, Dict, Tuple
 from collections import defaultdict
+
+# Namespace for deterministic point IDs. Any fixed UUID works; we pin one
+# here so IDs are stable across runs, machines, and Python versions.
+_POINT_ID_NAMESPACE = uuid.UUID("6f1e8a7b-4c2d-4e0f-9b1a-0d2e3f4a5b6c")
+
+
+def make_point_id(metadata: Dict, document: str) -> str:
+    """
+    Deterministic Qdrant point ID derived from (filepath, content).
+
+    Keys off content hash so identical chunks dedupe across runs and
+    identical chunks at different positions don't collide. Using uuid5
+    (not Python's hash()) avoids PYTHONHASHSEED randomization, which was
+    the source of duplicate points accumulating on every reindex.
+    """
+    filepath = metadata.get("filepath", "")
+    content_hash = hashlib.sha256(document.encode("utf-8")).hexdigest()
+    return str(uuid.uuid5(_POINT_ID_NAMESPACE, f"{filepath}::{content_hash}"))
 
 # Import configuration
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -477,17 +497,15 @@ def index_unified_collection(
         # FastEmbed returns generator of numpy arrays, convert each to list
         vectors = [vec.tolist() for vec in model.embed(documents)]
 
-        # Qdrant requires integer or UUID IDs, convert string IDs to integers via hash
         points = [
             PointStruct(
-                id=abs(hash(id_val))
-                % (2**63),  # Convert string ID to positive 64-bit integer
+                id=make_point_id(metadata, doc),
                 vector=vector,
                 payload={
                     **metadata,
                     "document": doc,
                     "original_id": id_val,
-                },  # Store original ID in payload
+                },
             )
             for id_val, vector, metadata, doc in zip(ids, vectors, metadatas, documents)
         ]
@@ -511,18 +529,15 @@ def index_unified_collection(
                 vec.tolist() for vec in model.embed(documents[i:batch_end])
             ]
 
-            # Create points with embeddings and metadata
-            # Qdrant requires integer or UUID IDs, convert string IDs to integers via hash
             points = [
                 PointStruct(
-                    id=abs(hash(id_val))
-                    % (2**63),  # Convert string ID to positive 64-bit integer
+                    id=make_point_id(metadata, doc),
                     vector=vector,
                     payload={
                         **metadata,
                         "document": doc,
                         "original_id": id_val,
-                    },  # Store original ID in payload
+                    },
                 )
                 for id_val, vector, metadata, doc in zip(
                     ids[i:batch_end],
