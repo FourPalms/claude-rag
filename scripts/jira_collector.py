@@ -140,9 +140,9 @@ def collect_jira_issues(
                         }
                     )
 
-                # Create separate chunk for each comment (first 5 comments)
+                # Create separate chunk for each comment (all comments)
                 comments = fields.get("comment", {}).get("comments", [])
-                for i, comment in enumerate(comments[:5]):
+                for i, comment in enumerate(comments):
                     comment_id = comment.get("id", f"comment_{i}")
                     author = comment.get("author", {}).get("displayName", "Unknown")
                     created_date = comment.get("created", "")[:10]
