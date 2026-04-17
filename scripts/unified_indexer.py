@@ -427,11 +427,18 @@ def index_unified_collection(
     """
     Create or update the unified knowledge collection.
     Only updates chunks for specified sources, leaves others intact.
+
+    Collection schema uses named vectors:
+      "dense"  — 384-dim cosine (MiniLM-L6-v2)
+      "sparse" — BM25 sparse with server-side IDF (Modifier.IDF on the collection)
     """
     from qdrant_client import QdrantClient
     from qdrant_client.models import (
         Distance,
         VectorParams,
+        SparseVectorParams,
+        Modifier,
+        SparseVector,
         Filter,
         FieldCondition,
         MatchAny,
@@ -439,14 +446,23 @@ def index_unified_collection(
         PointStruct,
     )
     from fastembed import TextEmbedding
+    from fastembed.sparse.bm25 import Bm25
 
     # Connect to Qdrant in Docker (longer timeout for bulk delete operations)
     client = QdrantClient(url="http://localhost:6333", timeout=120)
 
-    # Initialize embedding model (FastEmbed with ONNX for faster cold starts)
+    # Initialize dense embedding model (FastEmbed with ONNX for faster cold starts)
     print("Loading embedding model...")
     model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
     embedding_size = 384  # all-MiniLM-L6-v2 dimension
+
+    # Compute corpus-average chunk length (whitespace-split token count) for BM25 scoring.
+    # BM25 TF normalisation depends on avg_len; using the actual corpus average here gives
+    # accurate per-document length penalties.  We re-instantiate Bm25 per call because the
+    # module singleton pattern would carry a stale avg_len across partial re-indexes.
+    avg_len = sum(len(doc.split()) for doc in documents) / max(len(documents), 1)
+    print(f"BM25 avg_len computed from corpus: {avg_len:.1f} tokens/chunk")
+    sparse_model = Bm25(model_name="Qdrant/bm25", language="english", avg_len=avg_len)
 
     collection_name = "unified_knowledge"
 
@@ -460,10 +476,11 @@ def index_unified_collection(
         collection_exists = False
 
     if not collection_exists:
-        print(f"Creating '{collection_name}' collection...")
+        print(f"Creating '{collection_name}' collection with hybrid schema (dense + sparse)...")
         client.create_collection(
             collection_name=collection_name,
-            vectors_config=VectorParams(size=embedding_size, distance=Distance.COSINE),
+            vectors_config={"dense": VectorParams(size=embedding_size, distance=Distance.COSINE)},
+            sparse_vectors_config={"sparse": SparseVectorParams(modifier=Modifier.IDF)},
         )
     else:
         print(f"Using existing '{collection_name}' collection")
@@ -494,20 +511,30 @@ def index_unified_collection(
     if len(documents) <= BATCH_SIZE:
         # Small enough for single batch
         print("  Generating embeddings...")
-        # FastEmbed returns generator of numpy arrays, convert each to list
-        vectors = [vec.tolist() for vec in model.embed(documents)]
+        # Dense: FastEmbed returns generator of numpy arrays, convert each to list
+        dense_vectors = [vec.tolist() for vec in model.embed(documents)]
+        # Sparse: BM25 returns SparseEmbedding objects with .indices and .values
+        sparse_vectors = list(sparse_model.embed(documents))
 
         points = [
             PointStruct(
                 id=make_point_id(metadata, doc),
-                vector=vector,
+                vector={
+                    "dense": dense_vec,
+                    "sparse": SparseVector(
+                        indices=sparse_emb.indices.tolist(),
+                        values=sparse_emb.values.tolist(),
+                    ),
+                },
                 payload={
                     **metadata,
                     "document": doc,
                     "original_id": id_val,
                 },
             )
-            for id_val, vector, metadata, doc in zip(ids, vectors, metadatas, documents)
+            for id_val, dense_vec, sparse_emb, metadata, doc in zip(
+                ids, dense_vectors, sparse_vectors, metadatas, documents
+            )
         ]
 
         client.upsert(collection_name=collection_name, points=points, wait=True)
@@ -523,27 +550,35 @@ def index_unified_collection(
             if batch_num % 50 == 0 or batch_num == num_batches:
                 print(f"  Progress: {batch_num}/{num_batches} batches processed...")
 
-            # Generate embeddings for this batch
-            # FastEmbed returns generator of numpy arrays, convert each to list
-            batch_vectors = [
-                vec.tolist() for vec in model.embed(documents[i:batch_end])
-            ]
+            batch_docs = documents[i:batch_end]
+
+            # Dense embeddings for this batch
+            batch_dense = [vec.tolist() for vec in model.embed(batch_docs)]
+            # Sparse (BM25) embeddings for this batch
+            batch_sparse = list(sparse_model.embed(batch_docs))
 
             points = [
                 PointStruct(
                     id=make_point_id(metadata, doc),
-                    vector=vector,
+                    vector={
+                        "dense": dense_vec,
+                        "sparse": SparseVector(
+                            indices=sparse_emb.indices.tolist(),
+                            values=sparse_emb.values.tolist(),
+                        ),
+                    },
                     payload={
                         **metadata,
                         "document": doc,
                         "original_id": id_val,
                     },
                 )
-                for id_val, vector, metadata, doc in zip(
+                for id_val, dense_vec, sparse_emb, metadata, doc in zip(
                     ids[i:batch_end],
-                    batch_vectors,
+                    batch_dense,
+                    batch_sparse,
                     metadatas[i:batch_end],
-                    documents[i:batch_end],
+                    batch_docs,
                 )
             ]
 

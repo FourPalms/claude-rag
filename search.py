@@ -6,21 +6,47 @@ Can be called from query.py CLI or MCP server.
 
 from pathlib import Path
 from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, FieldCondition, MatchValue
+from qdrant_client.models import (
+    Filter,
+    FieldCondition,
+    MatchValue,
+    Prefetch,
+    SparseVector,
+    FusionQuery,
+    Fusion,
+)
 from fastembed import TextEmbedding
+from fastembed.sparse.bm25 import Bm25
 from typing import Dict, List, Any, Optional
 
-# Initialize embedding model once (module-level for reuse)
+# Initialize embedding models once (module-level for reuse across calls)
 _model = None
+_sparse_model = None
 
 
 def get_embedding_model():
-    """Lazy-load embedding model to avoid slow imports."""
+    """Lazy-load dense embedding model to avoid slow imports."""
     global _model
     if _model is None:
         # Use FastEmbed with ONNX for faster cold starts (3.6x faster than PyTorch)
         _model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
     return _model
+
+
+def get_sparse_model():
+    """Lazy-load BM25 sparse model for hybrid retrieval.
+
+    avg_len is intentionally left at the FastEmbed default (256.0) here.
+    At query time, BM25 TF generation is not sensitive to avg_len — only
+    document-side scoring (which happens server-side via Modifier.IDF on
+    the collection) depends on the corpus avg_len baked in at index time.
+    The query-side BM25 call just produces a TF-weighted token vector;
+    Qdrant multiplies by the IDF it already stored during indexing.
+    """
+    global _sparse_model
+    if _sparse_model is None:
+        _sparse_model = Bm25(model_name="Qdrant/bm25", language="english")
+    return _sparse_model
 
 
 # Payload keys that are safe to expose as exact-match filters.
@@ -116,10 +142,18 @@ def search_rag(
             "Run unified_indexer.py first to create index."
         ) from e
 
-    # Generate query embedding
+    # Generate dense query embedding
     model = get_embedding_model()
     # FastEmbed returns a generator, convert to list and get first result
-    query_vector = list(model.embed([query]))[0].tolist()
+    dense_q = list(model.embed([query]))[0].tolist()
+
+    # Generate sparse (BM25) query vector for hybrid retrieval
+    sparse_model = get_sparse_model()
+    sparse_emb = list(sparse_model.embed([query]))[0]
+    sparse_q = SparseVector(
+        indices=sparse_emb.indices.tolist(),
+        values=sparse_emb.values.tolist(),
+    )
 
     # Build optional metadata filter
     qdrant_filter = _build_filter({
@@ -130,13 +164,33 @@ def search_rag(
         "issue_key": issue_key,
     })
 
-    # Search collection using vector similarity (optionally filtered).
-    # query_filter=None is equivalent to no filter, preserving pre-change behavior.
+    # Hybrid search: dense + sparse prefetches fused server-side via RRF.
+    #
+    # - filter= goes on each Prefetch (NOT as top-level query_filter=).
+    #   query_filter= would narrow only after fusion, letting unfiltered hits
+    #   pollute the ranked list before being cut; Prefetch.filter= narrows
+    #   before ranking inside each branch, which is the correct behavior.
+    # - prefetch limit is max(40, n_results) to give RRF enough candidates.
+    #   Prefetch limit must be >= final limit; the clamp handles n_results > 40.
+    prefetch_limit = max(40, n_results)
     search_results = client.query_points(
         collection_name=collection_name,
-        query=query_vector,
+        prefetch=[
+            Prefetch(
+                query=dense_q,
+                using="dense",
+                limit=prefetch_limit,
+                filter=qdrant_filter,
+            ),
+            Prefetch(
+                query=sparse_q,
+                using="sparse",
+                limit=prefetch_limit,
+                filter=qdrant_filter,
+            ),
+        ],
+        query=FusionQuery(fusion=Fusion.RRF),
         limit=n_results,
-        query_filter=qdrant_filter,
     ).points
 
     # Extract documents from payload
