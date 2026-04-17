@@ -41,7 +41,7 @@ def search_rag(query: str, n_results: int = 5) -> Dict[str, Any]:
         ValueError: If collection doesn't exist (need to run indexer first)
     """
     # Connect to Qdrant in Docker
-    client = QdrantClient(url="http://localhost:6333")
+    client = QdrantClient(url="http://localhost:6333", timeout=60)
 
     # Use unified knowledge collection
     collection_name = "unified_knowledge"
