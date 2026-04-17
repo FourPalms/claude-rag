@@ -7,6 +7,7 @@ Exposes semantic search over team knowledge, code, and conversations.
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 # Add scripts directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -19,22 +20,58 @@ mcp = FastMCP("rag-system")
 
 
 @mcp.tool()
-async def search_knowledge(query: str, limit: int = 5) -> str:
+async def search_knowledge(
+    query: str,
+    limit: int = 5,
+    source: Optional[str] = None,
+    doc_type: Optional[str] = None,
+    chunk_type: Optional[str] = None,
+    project: Optional[str] = None,
+    issue_key: Optional[str] = None,
+) -> str:
     """Search team knowledge, code, and conversation history semantically.
 
-    Searches across:
-    - Team documentation (Sanctum, processes, architecture)
-    - PHP code (configured directories)
-    - Python code (configured directories)
-    - Conversation archives (JSONL session logs)
-    - Working memory and agent research
+    Searches across a unified index of team documentation, code, Jira tickets,
+    Slack messages, Slite notes, Puppet configs, session transcripts, and archives.
+    Optional filters narrow the search to a subset of chunks — pass them when you
+    know what kind of content you want (big context win; filter values that match
+    no chunks return an empty result list, never an error).
 
     Args:
-        query: Natural language search query
-        limit: Maximum number of results to return (1-20, default 5)
+        query: Natural language search query.
+        limit: Maximum number of results to return (1-20, default 5).
+        source: Restrict to one source. Valid values:
+            - "jira"     — Jira issues (titles, descriptions, comments)
+            - "slack"    — Slack messages and thread replies
+            - "code"     — PHP and Python source code (use doc_type to pick one)
+            - "js_ts"    — JS / TS / JSX / TSX source code
+            - "puppet"   — Puppet manifests, Ruby, Hiera YAML
+            - "sanctum"  — Team knowledge base (markdown)
+            - "sessions" — Claude Code session transcripts (JSONL)
+            - "archive"  — Archived session logs / old working memory
+            Any other value returns empty.
+        doc_type: Restrict to a file/content type. Useful values:
+            - "php", "py"           — under source="code"
+            - "ts", "tsx", "js", "jsx" — under source="js_ts"
+            - "pp", "rb", "yaml", "yml" — under source="puppet"
+            - "md"                  — markdown (sanctum, archive)
+            - "jira", "slack", "jsonl" — set to the source name for those sources
+        chunk_type: Restrict to a chunk kind. Meaning depends on source:
+            - jira:     "title", "description", "comment"
+            - code:     "class", "function", "method"
+            - js_ts:    "class", "function", "method"
+            - slack:    "message", "thread_parent", "thread_reply"
+            - sessions: "conversation_exchange"
+            - puppet:   "class", "define", "file", "function", "hiera_data", "method", "module"
+            - archive:  "session"
+        project: Jira project key, e.g. "SKY" or "BUGS". Only matches Jira chunks.
+            Implicitly narrows to source="jira" because no other source carries this field.
+        issue_key: Exact Jira issue key, e.g. "SKY-988". Only matches Jira chunks
+            (title + description + every comment for that issue). Best way to pull
+            everything about a single ticket.
 
     Returns:
-        Formatted search results with file paths, relevance scores, and previews
+        Formatted search results with file paths, relevance scores, and previews.
     """
     # Validate limit
     limit = max(1, min(20, limit))
@@ -43,7 +80,15 @@ async def search_knowledge(query: str, limit: int = 5) -> str:
     start_time = time.time()
 
     try:
-        results = search_rag(query, n_results=limit)
+        results = search_rag(
+            query,
+            n_results=limit,
+            source=source,
+            doc_type=doc_type,
+            chunk_type=chunk_type,
+            project=project,
+            issue_key=issue_key,
+        )
     except ValueError as e:
         return f"Error: {str(e)}\n\nThe RAG index may not be initialized. Run unified_indexer.py first."
     except Exception as e:
@@ -51,12 +96,29 @@ async def search_knowledge(query: str, limit: int = 5) -> str:
 
     elapsed_time = time.time() - start_time
 
+    # Build a short filter summary for the header (so the LLM can tell at a glance
+    # whether its filters were actually applied).
+    active_filters = {
+        k: v
+        for k, v in {
+            "source": source,
+            "doc_type": doc_type,
+            "chunk_type": chunk_type,
+            "project": project,
+            "issue_key": issue_key,
+        }.items()
+        if v
+    }
+
     # Format results for Claude
     output = []
     output.append(
         f"Found {len(results['documents'])} results from {results['count']} total documents"
     )
     output.append(f"Query time: {elapsed_time*1000:.1f}ms")
+    if active_filters:
+        filters_str = ", ".join(f"{k}={v}" for k, v in active_filters.items())
+        output.append(f"Filters: {filters_str}")
     output.append("")
 
     for i, (doc, metadata, distance) in enumerate(
@@ -68,8 +130,8 @@ async def search_knowledge(query: str, limit: int = 5) -> str:
 
         # Include additional metadata if available
         if "doc_type" in metadata:
-            doc_type = metadata["doc_type"]
-            if doc_type == "php":
+            doc_type_val = metadata["doc_type"]
+            if doc_type_val == "php":
                 output.append(
                     f"   Type: PHP code - {metadata.get('chunk_type', 'unknown')}"
                 )
@@ -77,7 +139,7 @@ async def search_knowledge(query: str, limit: int = 5) -> str:
                     output.append(f"   Function: {metadata['function_name']}")
                 if "class_name" in metadata:
                     output.append(f"   Class: {metadata['class_name']}")
-            elif doc_type == "py":
+            elif doc_type_val == "py":
                 output.append(
                     f"   Type: Python code - {metadata.get('chunk_type', 'unknown')}"
                 )
@@ -86,7 +148,7 @@ async def search_knowledge(query: str, limit: int = 5) -> str:
                 if "class_name" in metadata:
                     output.append(f"   Class: {metadata['class_name']}")
             else:
-                output.append(f"   Type: {doc_type}")
+                output.append(f"   Type: {doc_type_val}")
 
         # Full chunk content
         output.append(f"   Content: {doc}")
