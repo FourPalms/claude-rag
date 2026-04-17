@@ -38,6 +38,8 @@ from config import (
     SLACK_MAX_AGE_DAYS,
     SLACK_MAX_MESSAGES_PER_CHANNEL,
     SLACK_CHANNELS,
+    SLITE_API_KEY,
+    SLITE_ROOT_NOTE_IDS,
 )
 
 # Import collectors
@@ -48,6 +50,7 @@ from archive_chunker import chunk_archive_file
 from jsonl_session_chunker import collect_jsonl_sessions, chunk_jsonl_sessions
 from jira_collector import collect_jira_issues
 from slack_collector import collect_slack_messages
+from slite_collector import collect_slite_docs
 from puppet_collector import collect_puppet_code
 
 
@@ -373,6 +376,28 @@ def load_slack_messages(
     return documents, metadatas, ids
 
 
+def load_slite_docs(
+    slite_chunks: List[Dict],
+) -> Tuple[List[str], List[Dict], List[str]]:
+    """
+    Load Slite note chunks (complex: API fetch = N chunks).
+    Returns (documents, metadatas, ids).
+    """
+    documents = []
+    metadatas = []
+    ids = []
+
+    for i, chunk in enumerate(slite_chunks):
+        documents.append(chunk["content"])
+
+        metadata = {"source": "slite", "doc_type": "slite", **chunk["metadata"]}
+
+        metadatas.append(metadata)
+        ids.append(f"slite_chunk_{i}")
+
+    return documents, metadatas, ids
+
+
 def index_unified_collection(
     documents: List[str],
     metadatas: List[Dict],
@@ -586,6 +611,7 @@ Examples:
             "sessions",
             "jira",
             "slack",
+            "slite",
             "all",
         ],
         default=["all"],
@@ -602,6 +628,7 @@ Examples:
     index_sessions = index_all or "sessions" in args.sources
     index_jira = index_all or "jira" in args.sources
     index_slack = index_all or "slack" in args.sources
+    index_slite = index_all or "slite" in args.sources
     index_puppet = index_all or "puppet" in args.sources
 
     print("Unified RAG Indexer")
@@ -790,6 +817,23 @@ Examples:
         else:
             print("  ⚠️  No Slack messages collected")
 
+    # Source 7: Slite (team knowledge via REST API)
+    if index_slite and SLITE_API_KEY and SLITE_ROOT_NOTE_IDS:
+        print("  Collecting Slite notes...")
+        slite_chunks = collect_slite_docs(
+            api_key=SLITE_API_KEY,
+            root_note_ids=SLITE_ROOT_NOTE_IDS,
+        )
+
+        if slite_chunks:
+            docs, metas, ids = load_slite_docs(slite_chunks)
+            all_documents.extend(docs)
+            all_metadatas.extend(metas)
+            all_ids.extend(ids)
+            print(f"  ✓ Collected {len(docs)} Slite notes")
+        else:
+            print("  ⚠️  No Slite notes collected")
+
     # Future sources:
     # process_files = collect_process_docs()
     # agent_research_files = collect_agent_research_docs()
@@ -817,6 +861,8 @@ Examples:
         sources_being_updated.append("jira")
     if index_slack:
         sources_being_updated.append("slack")
+    if index_slite:
+        sources_being_updated.append("slite")
     if index_puppet:
         sources_being_updated.append("puppet")
 

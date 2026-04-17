@@ -84,3 +84,11 @@ SLACK_CHANNELS = [
     # "team-channel",
     # "dev-channel",
 ]
+
+# Slite — team knowledge base (REST API)
+# Get your API key from https://slite.com/api
+# Root note IDs are the doc IDs from URLs like https://bamboohr.slite.com/app/docs/<ID>
+SLITE_API_KEY = os.getenv("SLITE_API_KEY")
+SLITE_ROOT_NOTE_IDS = [
+    # "abc123xyz",  # e.g. "My Team" folder root note ID
+]
