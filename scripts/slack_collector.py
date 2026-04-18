@@ -233,28 +233,56 @@ def fetch_thread_replies(
 
     data = {"token": tokens["xoxc"], "channel": channel_id, "ts": thread_ts}
 
-    try:
-        response = requests.post(
-            "https://slack.com/api/conversations.replies",
-            headers=headers,
-            data=data,
-        )
-        response.raise_for_status()
-        result = response.json()
+    # Retry with backoff on 429. conversations.replies is a Tier 3 endpoint
+    # (~50 req/min), which a busy reindex burns through fast — especially on
+    # channels like #development with lots of long reply tails. Slack returns
+    # Retry-After when rate-limited; we honor it. On transient errors we
+    # back off exponentially before giving up.
+    MAX_ATTEMPTS = 5
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            response = requests.post(
+                "https://slack.com/api/conversations.replies",
+                headers=headers,
+                data=data,
+            )
 
-        if result.get("ok"):
-            messages = result.get("messages", [])
-            # Return all messages except the first (which is the parent)
-            return messages[1:] if len(messages) > 1 else []
-        else:
+            if response.status_code == 429:
+                retry_after = int(response.headers.get("Retry-After", 30))
+                print(
+                    f"  ⚠️  replies rate-limited, waiting {retry_after}s "
+                    f"(attempt {attempt + 1}/{MAX_ATTEMPTS})"
+                )
+                time.sleep(retry_after)
+                continue
+
+            response.raise_for_status()
+            result = response.json()
+
+            if result.get("ok"):
+                messages = result.get("messages", [])
+                # Drop the parent; only replies flow downstream.
+                return messages[1:] if len(messages) > 1 else []
             print(
-                f"  ⚠️  Failed to fetch thread replies: {result.get('error', 'unknown error')}"
+                f"  ⚠️  Failed to fetch thread replies: "
+                f"{result.get('error', 'unknown error')}"
             )
             return []
 
-    except Exception as e:
-        print(f"  ⚠️  Error fetching thread replies: {e}")
-        return []
+        except Exception as e:
+            if attempt < MAX_ATTEMPTS - 1:
+                backoff = 2**attempt
+                print(
+                    f"  ⚠️  replies error: {e}, retrying in {backoff}s "
+                    f"(attempt {attempt + 1}/{MAX_ATTEMPTS})"
+                )
+                time.sleep(backoff)
+                continue
+            print(f"  ⚠️  Error fetching thread replies (gave up): {e}")
+            return []
+
+    print(f"  ⚠️  replies: exhausted {MAX_ATTEMPTS} attempts, giving up")
+    return []
 
 
 def format_timestamp(ts: str) -> str:
