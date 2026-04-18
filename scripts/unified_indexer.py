@@ -667,6 +667,11 @@ Examples:
         default=["all"],
         help="Which sources to index (default: all)",
     )
+    parser.add_argument(
+        "--no-sync",
+        action="store_true",
+        help="Skip syncing code repos to their primary branch before indexing.",
+    )
     args = parser.parse_args()
 
     # Determine which sources to index
@@ -700,6 +705,41 @@ Examples:
         return 1
 
     print()
+
+    # Sync code repos to their primary branch before indexing. We do this
+    # first so the chunks we extract reflect current main, not whatever
+    # branch happened to be checked out.
+    #
+    # Hard rule: if ANY repo has uncommitted changes, abort the entire
+    # reindex. Switching branches on a dirty tree risks losing work —
+    # loud stop beats silent skip here.
+    if not args.no_sync and (index_code or index_js_ts or index_puppet):
+        from git_sync import find_dirty_repos, sync_all, print_sync_report
+
+        repo_paths: list = []
+        if index_code:
+            repo_paths.extend(PHP_CODE_PATHS)
+            repo_paths.extend(PYTHON_CODE_PATHS)
+        if index_js_ts:
+            repo_paths.extend(JS_TS_CODE_PATHS)
+        if index_puppet:
+            repo_paths.extend(PUPPET_CODE_PATHS)
+
+        dirty = find_dirty_repos(repo_paths)
+        if dirty:
+            print("✗ Refusing to reindex: uncommitted changes in code repos")
+            for repo in dirty:
+                print(f"    - {repo}")
+            print(
+                "\nCommit, stash, or discard those changes and re-run. "
+                "Pass --no-sync to bypass the sync step entirely."
+            )
+            return 2
+
+        print("Syncing code repos to primary branch...")
+        sync_results = sync_all(repo_paths)
+        print_sync_report(sync_results)
+        print()
 
     # Collect all documents and chunks
     all_documents = []

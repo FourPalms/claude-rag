@@ -46,6 +46,7 @@ LINT_FILES := \
 	search.py \
 	mcp_server.py \
 	$(SCRIPTS)/unified_indexer.py \
+	$(SCRIPTS)/git_sync.py \
 	$(SCRIPTS)/puppet_collector.py \
 	$(SCRIPTS)/php_code_collector.py \
 	$(SCRIPTS)/python_code_collector.py \
