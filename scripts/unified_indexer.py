@@ -423,6 +423,7 @@ def index_unified_collection(
     metadatas: List[Dict],
     ids: List[str],
     sources_to_update: List[str],
+    display=None,
 ):
     """
     Create or update the unified knowledge collection.
@@ -431,6 +432,9 @@ def index_unified_collection(
     Collection schema uses named vectors:
       "dense"  — 384-dim cosine (MiniLM-L6-v2)
       "sparse" — BM25 sparse with server-side IDF (Modifier.IDF on the collection)
+
+    Optional ``display`` is any object exposing ``push_chunk(metadata, doc)``
+    and ``set_progress(current, total)`` — used by the Matrix-rain live view.
     """
     from qdrant_client import QdrantClient
     from qdrant_client.models import (
@@ -505,6 +509,8 @@ def index_unified_collection(
     # Generate embeddings and add chunks (in batches for better performance)
     print(f"\nGenerating embeddings and indexing {len(documents)} new chunks...")
     start_time = time.time()
+    if display is not None:
+        display.set_progress(0, len(documents))
 
     BATCH_SIZE = 100  # Smaller batches for embedding generation + upload
 
@@ -515,6 +521,10 @@ def index_unified_collection(
         dense_vectors = [vec.tolist() for vec in model.embed(documents)]
         # Sparse: BM25 returns SparseEmbedding objects with .indices and .values
         sparse_vectors = list(sparse_model.embed(documents))
+
+        if display is not None:
+            for meta, doc in zip(metadatas, documents):
+                display.push_chunk(meta, doc)
 
         points = [
             PointStruct(
@@ -538,6 +548,8 @@ def index_unified_collection(
         ]
 
         client.upsert(collection_name=collection_name, points=points, wait=True)
+        if display is not None:
+            display.set_progress(len(documents), len(documents))
     else:
         # Split into batches for progress visibility
         num_batches = (len(documents) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -551,11 +563,16 @@ def index_unified_collection(
                 print(f"  Progress: {batch_num}/{num_batches} batches processed...")
 
             batch_docs = documents[i:batch_end]
+            batch_metas = metadatas[i:batch_end]
 
             # Dense embeddings for this batch
             batch_dense = [vec.tolist() for vec in model.embed(batch_docs)]
             # Sparse (BM25) embeddings for this batch
             batch_sparse = list(sparse_model.embed(batch_docs))
+
+            if display is not None:
+                for meta, doc in zip(batch_metas, batch_docs):
+                    display.push_chunk(meta, doc)
 
             points = [
                 PointStruct(
@@ -577,12 +594,14 @@ def index_unified_collection(
                     ids[i:batch_end],
                     batch_dense,
                     batch_sparse,
-                    metadatas[i:batch_end],
+                    batch_metas,
                     batch_docs,
                 )
             ]
 
             client.upsert(collection_name=collection_name, points=points, wait=True)
+            if display is not None:
+                display.set_progress(batch_end, len(documents))
 
     end_time = time.time()
     index_time = end_time - start_time
@@ -668,6 +687,11 @@ Examples:
         help="Which sources to index (default: all)",
     )
     parser.add_argument(
+        "--matrix",
+        action="store_true",
+        help="Render indexing progress as Matrix-style digital rain (requires a TTY).",
+    )
+    parser.add_argument(
         "--no-sync",
         action="store_true",
         help="Skip syncing code repos to their primary branch before indexing.",
@@ -712,7 +736,7 @@ Examples:
     #
     # Hard rule: if ANY repo has uncommitted changes, abort the entire
     # reindex. Switching branches on a dirty tree risks losing work —
-    # loud stop beats silent skip here.
+    # Jeremy explicitly wants a loud stop over silent skips here.
     if not args.no_sync and (index_code or index_js_ts or index_puppet):
         from git_sync import find_dirty_repos, sync_all, print_sync_report
 
@@ -956,17 +980,48 @@ Examples:
     if index_puppet:
         sources_being_updated.append("puppet")
 
-    # Index
-    client, index_time = index_unified_collection(
-        all_documents, all_metadatas, all_ids, sources_being_updated
-    )
-    count_result = client.count(collection_name="unified_knowledge", exact=True)
-    print(f"✓ Collection now contains {count_result.count} total chunks")
+    # Index (optionally wrapped in a Matrix-rain live display).
+    import contextlib
+    import io
 
-    # Summary
-    print_index_summary(all_metadatas, index_time)
+    use_matrix = False
+    if args.matrix:
+        from matrix_display import MatrixDisplay, is_tty
 
-    print("\nCollection 'unified_knowledge' ready for querying")
+        if is_tty():
+            use_matrix = True
+        else:
+            print("⚠️  --matrix requires a TTY; falling back to plain output.")
+
+    if use_matrix:
+        # Silence the indexer's own stdout while the rain is on screen — its
+        # print()s would corrupt the rendered frame. Stderr is left alone so
+        # real errors still reach the user.
+        suppressed = io.StringIO()
+        with MatrixDisplay() as display, contextlib.redirect_stdout(suppressed):
+            client, index_time = index_unified_collection(
+                all_documents,
+                all_metadatas,
+                all_ids,
+                sources_being_updated,
+                display=display,
+            )
+            count_result = client.count(
+                collection_name="unified_knowledge", exact=True
+            )
+        # After the matrix context exits the terminal is restored; print the
+        # summary the user actually wants to read.
+        print(f"✓ Collection now contains {count_result.count} total chunks")
+        print_index_summary(all_metadatas, index_time)
+        print("\nCollection 'unified_knowledge' ready for querying")
+    else:
+        client, index_time = index_unified_collection(
+            all_documents, all_metadatas, all_ids, sources_being_updated
+        )
+        count_result = client.count(collection_name="unified_knowledge", exact=True)
+        print(f"✓ Collection now contains {count_result.count} total chunks")
+        print_index_summary(all_metadatas, index_time)
+        print("\nCollection 'unified_knowledge' ready for querying")
 
     return 0
 
