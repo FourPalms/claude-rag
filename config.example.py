@@ -80,10 +80,16 @@ SLACK_TOKEN_FILE = "~/.claude/skills/slack-tools/config/tokens.json"
 SLACK_CHANNELS_FILE = "~/.claude/skills/slack-tools/config/channels.json"
 SLACK_MAX_AGE_DAYS = 30
 SLACK_MAX_MESSAGES_PER_CHANNEL = 2000
-SLACK_CHANNELS = [
-    # "team-channel",
-    # "dev-channel",
-]
+# SLACK_CHANNELS: per-channel ingestion config.
+# Keys are channel names (without the leading #). Each value is a dict of overrides
+# for that channel; an empty dict means "use the global defaults".
+# Supported override keys:
+#   max_age_days: int, overrides SLACK_MAX_AGE_DAYS for this channel.
+SLACK_CHANNELS = {
+    # "team-channel": {},
+    # "dev-channel": {},
+    # "deep-history-channel": {"max_age_days": 180},
+}
 
 # Slite — team knowledge base (REST API)
 # Get your API key from https://slite.com/api

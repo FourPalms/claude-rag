@@ -9,7 +9,7 @@ import json
 import re
 import time
 import requests
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
 from pathlib import Path
 from datetime import datetime
 
@@ -304,7 +304,7 @@ def format_timestamp(ts: str) -> str:
 
 
 def collect_slack_messages(
-    channel_names: List[str],
+    channel_names: Union[List[str], Dict[str, Dict]],
     token_file: str,
     channels_file: str,
     max_age_days: int = 30,
@@ -314,10 +314,15 @@ def collect_slack_messages(
     Fetch Slack messages from configured channels using time-based indexing.
 
     Args:
-        channel_names: List of channel names to fetch from
+        channel_names: Either a dict mapping channel name to an overrides dict
+            (e.g. {"docker-support": {"max_age_days": 180}, "development": {}}),
+            or a plain list of channel names (legacy). Supported override keys:
+              - max_age_days: int, overrides the default max_age_days for that channel.
+            Unknown override keys are ignored.
         token_file: Path to tokens.json
         channels_file: Path to channels.json
-        max_age_days: Fetch messages from last N days (default: 30)
+        max_age_days: Default fetch window (days) for channels that don't
+            override it (default: 30)
         max_messages_per_channel: Safety cap per channel (default: 2000)
 
     Returns:
@@ -327,6 +332,13 @@ def collect_slack_messages(
     """
     chunks = []
 
+    # Normalize legacy list-of-strings input to the dict shape. This keeps
+    # older callers working without change.
+    if isinstance(channel_names, list):
+        channels_config: Dict[str, Dict] = {name: {} for name in channel_names}
+    else:
+        channels_config = channel_names
+
     # Load tokens and channel mappings
     try:
         tokens = load_slack_tokens(token_file)
@@ -335,19 +347,13 @@ def collect_slack_messages(
         print(f"  ⚠️  Error loading Slack configuration: {e}")
         return []
 
-    # Calculate oldest timestamp (unix timestamp for max_age_days ago)
-    oldest_timestamp = time.time() - (max_age_days * 24 * 60 * 60)
-    oldest_date = datetime.fromtimestamp(oldest_timestamp).strftime("%Y-%m-%d")
-
-    print(f"  Fetching messages since {oldest_date} ({max_age_days} days ago)")
-
     # Load persistent user cache (shared location with bash skill)
     cache_file = "~/.claude/state/slack-tools/user-cache.json"
     user_cache = load_user_cache(cache_file)
     initial_cache_size = len(user_cache)
 
     # Fetch messages from each channel
-    for channel_name in channel_names:
+    for channel_name, channel_overrides in channels_config.items():
         if channel_name not in channels:
             print(f"  ⚠️  Channel '{channel_name}' not found in channels.json")
             continue
@@ -355,7 +361,16 @@ def collect_slack_messages(
         channel_info = channels[channel_name]
         channel_id = channel_info["id"]
 
-        print(f"  Fetching messages from #{channel_name}...")
+        # Resolve effective max_age_days for this channel (per-channel override
+        # wins over the function-level default). Unknown override keys are ignored.
+        channel_max_age_days = channel_overrides.get("max_age_days", max_age_days)
+        oldest_timestamp = time.time() - (channel_max_age_days * 24 * 60 * 60)
+        oldest_date = datetime.fromtimestamp(oldest_timestamp).strftime("%Y-%m-%d")
+
+        print(
+            f"  Fetching messages from #{channel_name} "
+            f"since {oldest_date} ({channel_max_age_days} days ago)..."
+        )
         fetch_start = time.time()
 
         # Fetch messages from channel with pagination

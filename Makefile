@@ -44,10 +44,10 @@ db:
 # ── Testing ───────────────────────────────────────────────────────────────────
 
 test:
-	$(PYTHON) -m pytest $(TESTS)/test_parsers.py -q
+	$(PYTHON) -m pytest $(TESTS) -q
 
 test-verbose:
-	$(PYTHON) -m pytest $(TESTS)/test_parsers.py -v
+	$(PYTHON) -m pytest $(TESTS) -v
 
 # ── Linting ───────────────────────────────────────────────────────────────────
 
@@ -70,7 +70,8 @@ LINT_FILES := \
 	$(SCRIPTS)/query.py \
 	$(SCRIPTS)/list_docs.py \
 	$(SCRIPTS)/show_stats.py \
-	$(TESTS)/test_parsers.py
+	$(TESTS)/test_parsers.py \
+	$(TESTS)/test_slack_collector_overrides.py
 
 lint:
 	$(PYTHON) -m black --check $(LINT_FILES)

@@ -39,6 +39,7 @@ def make_point_id(metadata: Dict, document: str) -> str:
     content_hash = hashlib.sha256(document.encode("utf-8")).hexdigest()
     return str(uuid.uuid5(_POINT_ID_NAMESPACE, f"{filepath}::{content_hash}"))
 
+
 # Import configuration
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import (
@@ -480,10 +481,14 @@ def index_unified_collection(
         collection_exists = False
 
     if not collection_exists:
-        print(f"Creating '{collection_name}' collection with hybrid schema (dense + sparse)...")
+        print(
+            f"Creating '{collection_name}' collection with hybrid schema (dense + sparse)..."
+        )
         client.create_collection(
             collection_name=collection_name,
-            vectors_config={"dense": VectorParams(size=embedding_size, distance=Distance.COSINE)},
+            vectors_config={
+                "dense": VectorParams(size=embedding_size, distance=Distance.COSINE)
+            },
             sparse_vectors_config={"sparse": SparseVectorParams(modifier=Modifier.IDF)},
         )
     else:
@@ -912,6 +917,9 @@ Examples:
     # Source 6: Slack (team conversations via API)
     if index_slack and SLACK_TOKEN_FILE and SLACK_CHANNELS_FILE and SLACK_CHANNELS:
         print("  Collecting Slack messages...")
+        # SLACK_CHANNELS is a dict of {channel_name: overrides_dict}. Passing
+        # it through as-is lets collect_slack_messages apply per-channel
+        # max_age_days overrides (e.g. longer history for docker-support).
         slack_chunks = collect_slack_messages(
             channel_names=SLACK_CHANNELS,
             token_file=SLACK_TOKEN_FILE,
@@ -1006,9 +1014,7 @@ Examples:
                 sources_being_updated,
                 display=display,
             )
-            count_result = client.count(
-                collection_name="unified_knowledge", exact=True
-            )
+            count_result = client.count(collection_name="unified_knowledge", exact=True)
         # After the matrix context exits the terminal is restored; print the
         # summary the user actually wants to read.
         print(f"✓ Collection now contains {count_result.count} total chunks")
