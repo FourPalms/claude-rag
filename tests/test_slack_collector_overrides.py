@@ -12,6 +12,7 @@ no network or disk access occurs. They only verify timestamp computation and
 argument wiring from collect_slack_messages into the Slack API call.
 """
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -70,7 +71,10 @@ def _run_collector(channels_arg, default_max_age_days=30):
         )
         return _empty_history_response()
 
-    with patch.object(
+    # These tests exercise the legacy stealth windowing logic (the oldest=
+    # timestamp passed to conversations.history). Force that backend explicitly;
+    # the default backend is now the MCP bridge.
+    with patch.dict(os.environ, {"SLACK_BACKEND": "stealth"}), patch.object(
         slack_collector, "load_slack_tokens", return_value=_fake_tokens()
     ), patch.object(
         slack_collector, "load_slack_channels", return_value=fake_channels

@@ -6,12 +6,21 @@ Thread-based chunking: threads with replies are combined into one chunk.
 """
 
 import json
+import os
 import re
 import time
 import requests
 from typing import List, Dict, Optional, Union
 from pathlib import Path
 from datetime import datetime
+
+# MCP bridge backend (default). The stealth xoxc/xoxd path below is dead under
+# Slack Enterprise (forced logout on every call) and is retained ONLY as an
+# emergency fallback behind SLACK_BACKEND=stealth. See slack_mcp_bridge.py.
+try:
+    from slack_mcp_bridge import fetch_channel_via_mcp
+except ImportError:  # pragma: no cover - import shim when run as a module
+    from scripts.slack_mcp_bridge import fetch_channel_via_mcp
 
 
 def load_slack_tokens(token_file: str) -> Dict[str, str]:
@@ -303,6 +312,220 @@ def format_timestamp(ts: str) -> str:
         return ts
 
 
+def resolve_mentions_static(text: str, id_to_name: Dict[str, str]) -> str:
+    """
+    Resolve <@USERID> mentions using an in-memory id->display-name map (no API).
+
+    Used by the MCP backend, which already carries display names inline for
+    message authors. We build the map from those inline names and use it to
+    rewrite in-text mentions to "@Display Name". Unknown IDs are left as-is so
+    nothing is silently dropped.
+
+    Args:
+        text: Message text with potential <@USERID> mentions.
+        id_to_name: Map of Slack user id -> display name harvested from the
+            bridge's inline author names.
+
+    Returns:
+        Text with resolvable mentions rewritten to "@Display Name".
+    """
+    if not text:
+        return text
+
+    def _sub(match: "re.Match") -> str:
+        uid = match.group(1)
+        name = id_to_name.get(uid)
+        return f"@{name}" if name else match.group(0)
+
+    return re.sub(r"<@([A-Z0-9]+)>", _sub, text)
+
+
+def reshape_bridge_messages(
+    messages: List[Dict],
+    channel_name: str,
+    channel_id: str,
+) -> List[Dict]:
+    """
+    Convert bridge JSON message records into the exact chunk dicts that
+    collect_slack_messages has always returned. This is the contract firewall:
+    the metadata keys, chunk_type values, and markdown headers here MUST match
+    the stealth path byte-for-byte so the rest of the RAG pipeline is untouched.
+
+    Bridge record schema (see slack_mcp_bridge.py):
+        ts, user_id, user_display, text, thread_ts, is_parent, is_reply,
+        reply_count
+
+    Produces the three chunk_types: "thread_parent", "thread_reply", "message".
+
+    Args:
+        messages: Validated bridge records for one channel.
+        channel_name: Channel name without leading '#'.
+        channel_id: Slack channel id.
+
+    Returns:
+        List of {"content": <markdown>, "metadata": {...}} chunks.
+    """
+    chunks: List[Dict] = []
+
+    # Build an id->display-name map from inline author names so we can resolve
+    # in-text <@USERID> mentions without any API fan-out. Also index parents so
+    # replies can name their thread starter.
+    id_to_name: Dict[str, str] = {}
+    parent_author_by_ts: Dict[str, str] = {}
+    for m in messages:
+        if m.get("user_id") and m.get("user_display"):
+            id_to_name.setdefault(m["user_id"], m["user_display"])
+        if m.get("is_parent"):
+            parent_author_by_ts[m["ts"]] = m.get("user_display", "Unknown")
+
+    for m in messages:
+        msg_ts = m["ts"]
+        author_display = m.get("user_display", "Unknown")
+        # The stealth path stored a short username plus a display name. The MCP
+        # connector only exposes the display name inline, so we use it for both
+        # author_username and author_display to keep every key populated.
+        author_username = author_display
+        formatted_ts = format_timestamp(msg_ts)
+        resolved_text = resolve_mentions_static(m.get("text", ""), id_to_name)
+
+        if m.get("is_reply"):
+            thread_ts = m.get("thread_ts") or msg_ts
+            parent_author = parent_author_by_ts.get(thread_ts, "Unknown")
+            content = f"""# Reply from @{author_username} in #{channel_name} thread
+**Date:** {formatted_ts}
+**Thread started by:** @{parent_author}
+
+{resolved_text}
+"""
+            metadata = {
+                "channel_name": channel_name,
+                "channel_id": channel_id,
+                "message_ts": msg_ts,
+                "thread_ts": thread_ts,
+                "thread_parent_author": parent_author,
+                "author_username": author_username,
+                "author_display": author_display,
+                "date": formatted_ts.split(" ")[0],
+                "timestamp": formatted_ts,
+                "is_thread_reply": True,
+                "chunk_type": "thread_reply",
+                "filename": f"{channel_name}_{msg_ts}.slack",
+                "filepath": f"slack://{channel_name}/{msg_ts}",
+            }
+            chunks.append({"content": content, "metadata": metadata})
+
+        elif m.get("is_parent"):
+            reply_count = m.get("reply_count", 0)
+            content = f"""# Thread started by @{author_username} in #{channel_name}
+**Date:** {formatted_ts}
+**Replies:** {reply_count}
+
+{resolved_text}
+"""
+            metadata = {
+                "channel_name": channel_name,
+                "channel_id": channel_id,
+                "message_ts": msg_ts,
+                "thread_ts": msg_ts,  # Parent's thread_ts is same as message_ts
+                "author_username": author_username,
+                "author_display": author_display,
+                "date": formatted_ts.split(" ")[0],
+                "timestamp": formatted_ts,
+                "is_thread_parent": True,
+                "reply_count": reply_count,
+                "chunk_type": "thread_parent",
+                "filename": f"{channel_name}_{msg_ts}.slack",
+                "filepath": f"slack://{channel_name}/{msg_ts}",
+            }
+            chunks.append({"content": content, "metadata": metadata})
+
+        else:
+            content = f"""# Message from @{author_username} in #{channel_name}
+**Date:** {formatted_ts}
+
+{resolved_text}
+"""
+            metadata = {
+                "channel_name": channel_name,
+                "channel_id": channel_id,
+                "message_ts": msg_ts,
+                "author_username": author_username,
+                "author_display": author_display,
+                "date": formatted_ts.split(" ")[0],
+                "timestamp": formatted_ts,
+                "is_thread": False,
+                "chunk_type": "message",
+                "filename": f"{channel_name}_{msg_ts}.slack",
+                "filepath": f"slack://{channel_name}/{msg_ts}",
+            }
+            chunks.append({"content": content, "metadata": metadata})
+
+    return chunks
+
+
+def _collect_slack_messages_mcp(
+    channels_config: Dict[str, Dict],
+    channels_file: str,
+    max_age_days: int,
+    max_messages_per_channel: int,
+) -> List[Dict]:
+    """
+    MCP-backed implementation of the collector. Pulls each channel through the
+    official claude_ai_Slack connector via the claude -p bridge, then reshapes
+    to the frozen chunk contract. No xoxc/xoxd, no slack.com calls.
+    """
+    chunks: List[Dict] = []
+
+    try:
+        channels = load_slack_channels(channels_file)
+    except Exception as e:
+        print(f"  ⚠️  Error loading Slack channels config: {e}")
+        return []
+
+    for channel_name, channel_overrides in channels_config.items():
+        if channel_name not in channels:
+            print(f"  ⚠️  Channel '{channel_name}' not found in channels.json")
+            continue
+
+        channel_id = channels[channel_name]["id"]
+        channel_max_age_days = channel_overrides.get("max_age_days", max_age_days)
+        oldest_timestamp = time.time() - (channel_max_age_days * 24 * 60 * 60)
+        oldest_date = datetime.fromtimestamp(oldest_timestamp).strftime("%Y-%m-%d")
+
+        print(
+            f"  Fetching messages from #{channel_name} via MCP bridge "
+            f"since {oldest_date} ({channel_max_age_days} days ago)..."
+        )
+        fetch_start = time.time()
+
+        try:
+            bridge_messages = fetch_channel_via_mcp(
+                channel_id=channel_id,
+                oldest_ts=oldest_timestamp,
+                max_messages=max_messages_per_channel,
+            )
+        except Exception as e:
+            print(f"  ⚠️  MCP bridge failed for #{channel_name}: {e}")
+            continue
+
+        fetch_time = time.time() - fetch_start
+
+        if not bridge_messages:
+            print(f"  ⚠️  No messages returned for #{channel_name}")
+            continue
+
+        channel_chunks = reshape_bridge_messages(
+            bridge_messages, channel_name, channel_id
+        )
+        chunks.extend(channel_chunks)
+        print(
+            f"  ✓ #{channel_name}: {len(bridge_messages)} messages "
+            f"→ {len(channel_chunks)} chunks in {fetch_time:.1f}s"
+        )
+
+    return chunks
+
+
 def collect_slack_messages(
     channel_names: Union[List[str], Dict[str, Dict]],
     token_file: str,
@@ -313,13 +536,20 @@ def collect_slack_messages(
     """
     Fetch Slack messages from configured channels using time-based indexing.
 
+    Backend is selected by the SLACK_BACKEND env var:
+      - "mcp" (default): official claude_ai_Slack connector via the claude -p
+        bridge. Sanctioned OAuth, no forced logout.
+      - "stealth": the legacy xoxc/xoxd HTTP path. DEAD under Slack Enterprise
+        (triggers a forced logout on every call). Retained only as an emergency
+        toggle; do not use it.
+
     Args:
         channel_names: Either a dict mapping channel name to an overrides dict
             (e.g. {"docker-support": {"max_age_days": 180}, "development": {}}),
             or a plain list of channel names (legacy). Supported override keys:
               - max_age_days: int, overrides the default max_age_days for that channel.
             Unknown override keys are ignored.
-        token_file: Path to tokens.json
+        token_file: Path to tokens.json (only used by the stealth backend).
         channels_file: Path to channels.json
         max_age_days: Default fetch window (days) for channels that don't
             override it (default: 30)
@@ -330,14 +560,46 @@ def collect_slack_messages(
         - content: Formatted message or thread text
         - metadata: channel, author, date, thread info, etc.
     """
-    chunks = []
-
-    # Normalize legacy list-of-strings input to the dict shape. This keeps
-    # older callers working without change.
+    # Normalize legacy list-of-strings input to the dict shape.
     if isinstance(channel_names, list):
         channels_config: Dict[str, Dict] = {name: {} for name in channel_names}
     else:
         channels_config = channel_names
+
+    backend = os.environ.get("SLACK_BACKEND", "mcp").strip().lower()
+    if backend == "stealth":
+        print("  ⚠️  SLACK_BACKEND=stealth — using the DEAD xoxc/xoxd path.")
+        return _collect_slack_messages_stealth(
+            channels_config,
+            token_file,
+            channels_file,
+            max_age_days,
+            max_messages_per_channel,
+        )
+
+    return _collect_slack_messages_mcp(
+        channels_config,
+        channels_file,
+        max_age_days,
+        max_messages_per_channel,
+    )
+
+
+def _collect_slack_messages_stealth(
+    channels_config: Dict[str, Dict],
+    token_file: str,
+    channels_file: str,
+    max_age_days: int = 30,
+    max_messages_per_channel: int = 2000,
+) -> List[Dict]:
+    """
+    DEAD legacy backend: xoxc/xoxd browser-session tokens hitting slack.com.
+
+    Under Slack Enterprise this triggers an immediate forced logout on every
+    call. Kept intact only so SLACK_BACKEND=stealth can flip back during
+    cutover if the MCP path ever needs to be bypassed. DO NOT run this casually.
+    """
+    chunks = []
 
     # Load tokens and channel mappings
     try:
