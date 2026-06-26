@@ -82,7 +82,7 @@ lint-fix:
 # ── Indexing ──────────────────────────────────────────────────────────────────
 
 index:
-	$(INDEX_ENV) $(PYTHON) $(SCRIPTS)/unified_indexer.py
+	$(INDEX_ENV) $(PYTHON) $(SCRIPTS)/unified_indexer.py $(INDEX_ARGS)
 
 index-all: index
 
