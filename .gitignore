@@ -34,3 +34,6 @@ config.py
 
 # Logs
 logs/
+
+# FastEmbed ONNX model cache (persistent across reboots; not committed)
+.fastembed_cache/
