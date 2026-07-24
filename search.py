@@ -19,6 +19,12 @@ from fastembed import TextEmbedding
 from fastembed.sparse.bm25 import Bm25
 from typing import Dict, List, Any, Optional
 
+# FastEmbed caches its ONNX models here. Pin it to a persistent directory next
+# to this checkout instead of FastEmbed's default ($TMPDIR), which macOS purges
+# on reboot and periodic temp cleanup — that purge is what produces intermittent
+# "model.onnx missing" errors. Keeping the cache out of $TMPDIR makes it durable.
+_CACHE_DIR = str(Path(__file__).resolve().parent / ".fastembed_cache")
+
 # Initialize embedding models once (module-level for reuse across calls)
 _model = None
 _sparse_model = None
@@ -29,7 +35,7 @@ def get_embedding_model():
     global _model
     if _model is None:
         # Use FastEmbed with ONNX for faster cold starts (3.6x faster than PyTorch)
-        _model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        _model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2", cache_dir=_CACHE_DIR)
     return _model
 
 
@@ -45,7 +51,7 @@ def get_sparse_model():
     """
     global _sparse_model
     if _sparse_model is None:
-        _sparse_model = Bm25(model_name="Qdrant/bm25", language="english")
+        _sparse_model = Bm25(model_name="Qdrant/bm25", language="english", cache_dir=_CACHE_DIR)
     return _sparse_model
 
 
