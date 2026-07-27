@@ -1,6 +1,6 @@
 # RAG System - Unified Knowledge Search
 
-A production-ready RAG (Retrieval-Augmented Generation) system for semantic search across team knowledge, code, session archives, Jira tickets, and Slack conversations — integrated as a native Claude Code tool via MCP.
+A production-ready RAG (Retrieval-Augmented Generation) system for hybrid semantic + keyword search across team knowledge, code, session archives, Jira tickets, Slack conversations, and Slite docs — integrated as a native Claude Code tool via MCP.
 
 **Status:** Production-ready
 
@@ -49,9 +49,24 @@ JIRA_EMAIL     = "you@yourorg.com"
 JIRA_API_TOKEN = "your-api-token"
 JIRA_PROJECTS  = [{"project": "PROJ", "max_issues": 300}]
 
-# Slack (optional) — set your bot token and channel names
-SLACK_CHANNELS = ["engineering-team", "your-other-channel"]
+# Slack (optional) — token/channel files plus per-channel ingestion config.
+# Each channel maps to a dict of overrides ({} = use global defaults).
+SLACK_TOKEN_FILE    = "~/.claude/skills/slack-tools/config/tokens.json"
+SLACK_CHANNELS_FILE = "~/.claude/skills/slack-tools/config/channels.json"
+SLACK_MAX_AGE_DAYS  = 30
+SLACK_CHANNELS = {
+    "engineering-team": {},
+    "deep-history-channel": {"max_age_days": 180},  # per-channel override
+}
+
+# Slite (optional) — team knowledge base via REST API
+SLITE_API_KEY       = os.getenv("SLITE_API_KEY")
+SLITE_ROOT_NOTE_IDS = ["your-root-note-id"]
 ```
+
+Slack can be ingested either through the Slack API directly or through the
+`slack_mcp_bridge.py` bridge to Claude Code's official Slack MCP connector — see
+`config.example.py` and `HOW_TO_USE.md` for the token setup.
 
 ### 4. Index your content
 
@@ -65,8 +80,12 @@ To re-index a single source without rebuilding everything:
 ```bash
 python3 scripts/unified_indexer.py --sources jira
 python3 scripts/unified_indexer.py --sources code sessions
-# Available: sanctum archive code js_ts puppet sessions jira slack
+# Available: sanctum archive code js_ts puppet sessions jira slack slite
 ```
+
+Code repos are synced to their primary branch before indexing by default; pass
+`--no-sync` to index the working tree as-is (used by the nightly job so a dirty
+or off-branch checkout never blocks the run).
 
 ### 5. Register with Claude Code
 
@@ -80,8 +99,13 @@ Restart Claude Code. The `search_knowledge` tool is now available — Claude wil
 ```python
 # Tool signature
 search_knowledge(
-    query: str,      # Natural language search query
-    limit: int = 5   # Max results (1–20)
+    query: str,                 # Natural language search query
+    limit: int = 5,             # Max results (1–20)
+    source: str | None = None,  # Restrict to one source (e.g. "code", "jira", "slack")
+    doc_type: str | None = None,   # Restrict to a file/content type (e.g. "php", "md")
+    chunk_type: str | None = None, # Restrict to a chunk kind (e.g. "method", "description")
+    project: str | None = None,    # Restrict to a Jira project
+    issue_key: str | None = None,  # Restrict to a single Jira issue
 ) -> str
 ```
 
@@ -96,11 +120,13 @@ A unified RAG system that indexes and semantically searches:
 - **Archives** (session logs chunked by session)
 - **Conversations** (JSONL session logs from a configurable lookback window)
 - **Jira tickets** (one or more projects via REST API)
-- **Slack messages** (one or more channels via Slack API)
+- **Slack messages** (one or more channels via the Slack API or MCP bridge)
+- **Slite docs** (team knowledge base via REST API)
 
 **Key features:**
 - One unified collection — query anything, get answers from anywhere
-- Semantic search (understands meaning, not just keywords)
+- Hybrid retrieval — dense embeddings + BM25 sparse vectors fused server-side with Reciprocal Rank Fusion, so exact identifiers and semantic meaning both count
+- Metadata-filtered search (restrict by source, doc type, chunk type, Jira project/issue)
 - ~60–500ms query speed
 - Selective incremental indexing (update one source without rebuilding everything)
 - Rich metadata per chunk (source, type, class, function, session number, Jira issue, Slack channel)
@@ -112,9 +138,18 @@ A unified RAG system that indexes and semantically searches:
 
 ### Vector Database
 - **Qdrant** running in Docker (`http://localhost:6333`)
-- **Embedding model:** `all-MiniLM-L6-v2` (general-purpose, works for text and code)
-- **Storage:** One unified collection (`unified_knowledge`) with metadata filtering
-- **Migrated from ChromaDB:** Qdrant handles large-scale indexing better (50k+ chunks)
+- **Dense embedding model:** `all-MiniLM-L6-v2` (general-purpose, works for text and code)
+- **Sparse model:** BM25 (via `fastembed`) for keyword/identifier matching
+- **Storage:** One unified collection (`unified_knowledge`) holding both dense and sparse vectors, with metadata filtering
+- **Migrated from ChromaDB:** Qdrant handles large-scale indexing better (50k+ chunks) and natively supports hybrid vectors
+
+### Retrieval
+Every query runs against both the dense (semantic) and sparse (BM25 keyword) vectors,
+and Qdrant fuses the two result sets server-side with Reciprocal Rank Fusion (RRF).
+This means an exact identifier like `refreshToken` and a fuzzy concept like
+"how do we renew auth tokens" both surface the right chunks. Optional metadata
+filters (source, doc type, chunk type, Jira project/issue) narrow the search space
+before ranking.
 
 ### Chunking Strategies
 
@@ -142,7 +177,7 @@ A unified RAG system that indexes and semantically searches:
 - Each ticket split into up to 3 chunk types:
   - Title chunk (metadata only)
   - Description chunk (full description)
-  - Comment chunks (configurable max per ticket)
+  - Comment chunks (one chunk per comment, all comments indexed)
 - Preserves issue key, status, assignee, dates
 
 **Slack messages:**
@@ -230,13 +265,13 @@ A unified RAG system that indexes and semantically searches:
 ├── mcp_server.py                  # FastMCP server (Claude Code integration)
 ├── docker-compose.yml             # Qdrant container configuration
 ├── .gitignore                     # Exclude database and temp files
-├── docs/
-│   ├── step-one-findings.md       # Proof of concept analysis
-│   └── mcp-integration-build.md   # MCP server build log
 ├── tests/
-│   └── test_parsers.py            # pytest suite (all parsers covered)
+│   ├── test_parsers.py            # pytest suite (all parsers/collectors covered)
+│   ├── test_slack_collector_overrides.py  # per-channel Slack override tests
+│   └── test_slack_mcp_reshape.py  # Slack MCP bridge reshaping tests
 ├── scripts/
-│   ├── unified_indexer.py         # Main indexer (selective updates)
+│   ├── unified_indexer.py         # Main indexer (selective updates, git sync)
+│   ├── git_sync.py                # Sync code repos to primary branch before indexing
 │   ├── php_code_collector.py      # Tree-sitter AST-based PHP chunking
 │   ├── python_code_collector.py   # Tree-sitter AST-based Python chunking
 │   ├── js_ts_code_collector.py    # Tree-sitter AST-based JS/TS chunking
@@ -245,6 +280,10 @@ A unified RAG system that indexes and semantically searches:
 │   ├── jsonl_session_chunker.py   # JSONL conversation log chunking
 │   ├── jira_collector.py          # Jira REST API fetcher
 │   ├── slack_collector.py         # Slack API fetcher (thread-aware)
+│   ├── slack_mcp_bridge.py        # Bridge to Claude Code's official Slack MCP connector
+│   ├── slite_collector.py         # Slite REST API fetcher
+│   ├── index_sanctum.py           # Sanctum knowledge-base indexer
+│   ├── matrix_display.py          # Matrix-rain live indexer display
 │   ├── query.py                   # Semantic search CLI interface
 │   ├── list_docs.py               # Show indexed chunks
 │   └── show_stats.py              # Display collection statistics
@@ -285,10 +324,11 @@ ARCHIVE_PATHS = ["~/.claude/archive/working-memory.md"]
 PHP_CODE_PATHS = ["~/repos/your-php-app"]
 PYTHON_CODE_PATHS = ["~/repos/your-python-app"]
 PUPPET_CODE_PATHS = ["~/repos/puppet/site", "~/repos/puppet/hieradata"]
-JSONL_SESSION_PATHS = ["~/.claude/projects"]  # Claude Code session logs
-JIRA_PROJECTS = ["PROJ"]                       # One or more Jira project keys
-SLACK_CHANNELS = ["your-channel"]              # One or more Slack channel names
-JSONL_LOOKBACK_DAYS = 60                       # How many days of sessions to index
+JSONL_SESSION_PATHS = ["~/.claude/projects"]   # Claude Code session logs
+JIRA_PROJECTS = [{"project": "PROJ", "max_issues": 300}]  # One or more Jira projects
+SLACK_CHANNELS = {"your-channel": {}}          # channel -> per-channel override dict
+SLITE_ROOT_NOTE_IDS = ["your-root-note-id"]    # Slite docs to index
+JSONL_LOOKBACK_DAYS = 60                        # How many days of sessions to index
 ```
 
 **Query performance:** ~60–500ms per query  
@@ -298,9 +338,11 @@ JSONL_LOOKBACK_DAYS = 60                       # How many days of sessions to in
 
 ## Next Steps
 
-**Near-term:**
-- Metadata filtering in the query tool (e.g., "only search code")
-- Support for additional Jira projects and Slack channels
+**Done recently:**
+- ✅ Hybrid dense + BM25 retrieval with server-side RRF fusion
+- ✅ Metadata filtering in the query tool (source / doc_type / chunk_type / project / issue)
+- ✅ Slack MCP bridge + per-channel `max_age_days` overrides
+- ✅ Slite ingestion; git sync to primary branch before indexing
 
 **Future enhancements:**
 - Query history and analytics (track what's being searched)
