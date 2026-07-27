@@ -40,6 +40,33 @@ def make_point_id(metadata: Dict, document: str) -> str:
     return str(uuid.uuid5(_POINT_ID_NAMESPACE, f"{filepath}::{content_hash}"))
 
 
+def resolve_sources_to_update(
+    all_metadatas: List[Dict], requested_sources: List[str]
+) -> Tuple[List[str], List[str]]:
+    """
+    Decide which sources get wiped-and-replaced this run.
+
+    Indexing is delete-then-readd per source: every existing chunk for a source
+    is deleted, then the freshly collected chunks are added. That wipe MUST be
+    keyed off what was actually collected — NOT off the request flags. If a
+    collector fails or returns empty (missing config, expired auth, a
+    rate-limit, a transient MCP hiccup), wiping on the request flag alone would
+    delete the source's chunks while adding nothing back, silently destroying
+    good data (this is exactly how the Slack index once got zeroed).
+
+    Returns:
+        (sources_being_updated, skipped_sources)
+        - sources_being_updated: sources that produced >=1 chunk, sorted; only
+          these are safe to wipe-and-replace.
+        - skipped_sources: requested sources that collected 0 chunks, so their
+          existing chunks are preserved. Callers should surface these loudly.
+    """
+    collected_sources = {meta.get("source") for meta in all_metadatas} - {None}
+    sources_being_updated = sorted(collected_sources)
+    skipped_sources = [s for s in requested_sources if s not in collected_sources]
+    return sources_being_updated, skipped_sources
+
+
 # Import configuration
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import (
@@ -967,26 +994,40 @@ Examples:
 
     print(f"\nTotal chunks to index: {len(all_documents)}")
 
-    # Determine which sources we're updating
-    sources_being_updated = []
+    # The sources the caller ASKED to refresh this run.
+    requested_sources = []
     if index_sanctum:
-        sources_being_updated.append("sanctum")
+        requested_sources.append("sanctum")
     if index_archive:
-        sources_being_updated.append("archive")
+        requested_sources.append("archive")
     if index_code:
-        sources_being_updated.append("code")
+        requested_sources.append("code")
     if index_js_ts:
-        sources_being_updated.append("js_ts")
+        requested_sources.append("js_ts")
     if index_sessions:
-        sources_being_updated.append("sessions")
+        requested_sources.append("sessions")
     if index_jira:
-        sources_being_updated.append("jira")
+        requested_sources.append("jira")
     if index_slack:
-        sources_being_updated.append("slack")
+        requested_sources.append("slack")
     if index_slite:
-        sources_being_updated.append("slite")
+        requested_sources.append("slite")
     if index_puppet:
-        sources_being_updated.append("puppet")
+        requested_sources.append("puppet")
+
+    # Only wipe-and-replace sources that actually produced chunks this run;
+    # preserve (don't wipe) any requested source that collected 0 chunks. See
+    # resolve_sources_to_update for the full rationale.
+    sources_being_updated, skipped_sources = resolve_sources_to_update(
+        all_metadatas, requested_sources
+    )
+    if skipped_sources:
+        print(
+            "⚠️  Collected 0 chunks for requested source(s): "
+            f"{', '.join(skipped_sources)} — leaving their existing chunks in "
+            "place (NOT wiping). Investigate the collector before trusting the "
+            "next run."
+        )
 
     # Index (optionally wrapped in a Matrix-rain live display).
     import contextlib
