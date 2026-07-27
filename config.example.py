@@ -75,9 +75,12 @@ JIRA_PROJECTS = [
     {"project": "PROJ", "max_issues": 300},
 ]
 
-# Slack configuration
-SLACK_TOKEN_FILE = "~/.claude/skills/slack-tools/config/tokens.json"
-SLACK_CHANNELS_FILE = "~/.claude/skills/slack-tools/config/channels.json"
+# Slack configuration.
+# Channel roster is committed at config/channels.json. tokens.json is only used
+# by the dead xoxc/xoxd "stealth" backend; the default MCP connector path never
+# reads it, so this path need not exist.
+SLACK_TOKEN_FILE = str(Path(__file__).parent / "config" / "tokens.json")
+SLACK_CHANNELS_FILE = str(Path(__file__).parent / "config" / "channels.json")
 SLACK_MAX_AGE_DAYS = 30
 SLACK_MAX_MESSAGES_PER_CHANNEL = 2000
 # SLACK_CHANNELS: per-channel ingestion config.

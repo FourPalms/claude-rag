@@ -1,0 +1,110 @@
+{
+  "automation-workflows-agents": {
+    "id": "C0A5BLP8TUG",
+    "name": "#automation-workflows-agents",
+    "description": "Automation workflows agents channel",
+    "write-enabled": false
+  },
+  "development": {
+    "id": "C02UYT4C9",
+    "name": "#development",
+    "description": "General development channel",
+    "write-enabled": false
+  },
+  "packet-workflows": {
+    "id": "C093WK31K7H",
+    "name": "#packet-workflows",
+    "description": "General channel for Workflows project. Focus: automating new hire packet (onboarding) as first use case. Terrible name but refers to 'new hire packet' functionality.",
+    "write-enabled": false
+  },
+  "packet-workflows-dev": {
+    "id": "C0AHURDV2J3",
+    "name": "#packet-workflows-dev",
+    "description": "Dev-centric sister channel to packet-workflows. Technical discussions for Workflows project implementation.",
+    "write-enabled": false
+  },
+  "skysteelers": {
+    "id": "C08GM20DP29",
+    "name": "#skysteelers",
+    "description": "SkySteelers main channel",
+    "write-enabled": false
+  },
+  "skysteelers-be": {
+    "id": "C091G323GPQ",
+    "name": "#skysteelers-be",
+    "description": "SkySteelers backend channel",
+    "write-enabled": true
+  },
+  "skysteelers-team": {
+    "id": "C08DXD2NMGS",
+    "name": "#skysteelers-team",
+    "description": "SkySteelers team channel - general team discussions, QA coordination, social activities",
+    "write-enabled": false
+  },
+  "ai-tools-launchpad": {
+    "id": "C09PVHHT5ND",
+    "name": "#ai-tools-launchpad",
+    "description": "Company-wide AI tools rollout channel (Project Apollo) — announcements, usage caps, plan transitions, troubleshooting",
+    "write-enabled": false
+  },
+  "working-with-ai": {
+    "id": "C0549BSKHQT",
+    "name": "#working-with-ai",
+    "description": "Company-wide discussion on using AI tools in daily work",
+    "write-enabled": false
+  },
+  "building-with-ai": {
+    "id": "C08KVP56TPD",
+    "name": "#building-with-ai",
+    "description": "Company-wide discussion on building AI-powered features and tools",
+    "write-enabled": false
+  },
+  "engineering-announcements": {
+    "id": "C049Z2RFYCV",
+    "name": "#engineering-announcements",
+    "description": "Important announcements for engineers and QA, posted by engineering leadership. Indexed for announcement/history lookup.",
+    "write-enabled": false
+  },
+  "artemis-feedback": {
+    "id": "C0AU38UDRM4",
+    "name": "#artemis-feedback",
+    "description": "Feedback and discussion channel for Project Artemis (AI ticket-to-PR system). Indexed for context on Artemis behavior, known issues, and team feedback.",
+    "write-enabled": false
+  },
+  "jeremy-h-test-2345672340589": {
+    "id": "C0AP5LA69DE",
+    "name": "#jeremy-h-test-2345672340589",
+    "description": "",
+    "write-enabled": true
+  },
+  "docker-support": {
+    "id": "C01MVF5623A",
+    "name": "#docker-support",
+    "description": "Company-wide Docker / local dev troubleshooting channel. Indexed for historical issue lookup.",
+    "write-enabled": false
+  },
+  "carla-dm": {
+    "id": "D0A4UD4D27J",
+    "name": "DM with Carla Gouveia",
+    "description": "Direct message with Carla (cgouveia, U044HJ3GJRZ) — Skysteelers teammate",
+    "write-enabled": true
+  },
+  "ci-notifications-dm": {
+    "id": "D06JD22HNCX",
+    "name": "DM with bamboohr_ci__v2_",
+    "description": "BambooHR CI v2 build-complete notifications for `main` PRs",
+    "write-enabled": false
+  },
+  "shared-state-workstream": {
+    "id": "C0B4X5RLYJD",
+    "name": "#shared-state-workstream",
+    "description": "Cross-team workstream for SHRM Shared State / Ask Shared Context (SYN-1607). Renamed 2026-05-28 from shared-state-coordination. Trio-to-trio handoff from Synths to Skysteelers; pod = Jeremy/Kevin/Kyle.",
+    "write-enabled": true
+  },
+  "juan-dm": {
+    "id": "D0B94LHTP18",
+    "name": "DM with Juan Rodriguez",
+    "description": "Direct message with Juan Rodriguez — author of the Ask Page Actions design doc (BENCH-364 effort).",
+    "write-enabled": true
+  }
+}

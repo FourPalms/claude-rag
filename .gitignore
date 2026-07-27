@@ -37,3 +37,6 @@ logs/
 
 # FastEmbed ONNX model cache (persistent across reboots; not committed)
 .fastembed_cache/
+
+# Slack tokens (stealth backend only; never commit real tokens)
+config/tokens.json
