@@ -17,9 +17,49 @@ import time
 import uuid
 import hashlib
 import argparse
+import subprocess
+import traceback
 from pathlib import Path
 from typing import List, Dict, Tuple
 from collections import defaultdict
+
+
+def notify_macos(title: str, message: str) -> None:
+    """
+    Pop a modal alert dialog the user cannot miss. Best-effort; never raises.
+
+    The indexer runs unattended via launchd (StandardOut/Err go to a log file
+    the user never reads), so warnings printed to stdout go unseen. A banner
+    ('display notification') is the wrong tool here: it auto-dismisses in
+    seconds and is silently dropped when Script Editor's notification
+    permission is off — and 8am is exactly when nobody's watching the screen.
+    A modal 'display dialog' instead persists until dismissed, guaranteeing a
+    failed or destructive ingest is seen whenever the user returns.
+
+    Fired detached (Popen, no wait) so the blocking dialog never holds up or
+    delays the indexing run. To switch back to a non-intrusive banner, replace
+    the script below with: f'display notification "{safe_message}" with title
+    "{safe_title}"'.
+    """
+    # AppleScript string literals are double-quoted; collapse any double quotes
+    # in our text to single quotes so the -e argument stays well-formed.
+    safe_message = message.replace('"', "'")
+    safe_title = title.replace('"', "'")
+    script = (
+        f'display dialog "{safe_message}" with title "{safe_title}" '
+        'buttons {"OK"} default button "OK" with icon caution'
+    )
+    try:
+        subprocess.Popen(
+            ["osascript", "-e", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        # The alert is a courtesy, not a requirement — never let it break or
+        # delay the indexing run.
+        pass
+
 
 # Namespace for deterministic point IDs. Any fixed UUID works; we pin one
 # here so IDs are stable across runs, machines, and Python versions.
@@ -774,6 +814,10 @@ Examples:
     index_meetings = index_all or "meetings" in args.sources
     index_puppet = index_all or "puppet" in args.sources
 
+    # Collect human-actionable failures as we go; surfaced via a macOS
+    # notification at the end of the run since nobody reads the launchd log.
+    run_warnings: List[str] = []
+
     print("Unified RAG Indexer")
     print("=" * 60)
 
@@ -781,6 +825,59 @@ Examples:
         sources_list = [s for s in args.sources if s != "all"]
         print(f"Indexing sources: {', '.join(sources_list)}")
         print("=" * 60)
+
+    # Validate API credentials before doing any expensive collection work.
+    #
+    # An expired credential does not fail loudly: the affected source collects
+    # zero documents, its existing chunks are preserved (better stale than
+    # empty), and searches keep returning plausible results while the data
+    # silently stops moving. Both the Jira and Slack credentials turned out to
+    # be dead on 2026-08-10, found only by accident. Checking up front folds
+    # them into run_warnings so they reach the same alert as any other failure,
+    # and does it before the ~45 minutes of embedding rather than after.
+    #
+    # Deliberately non-fatal: a dead Slite key is no reason to skip indexing
+    # code and sessions.
+    credential_sources = [
+        name
+        for name, wanted in (
+            ("jira", index_jira),
+            ("slack", index_slack),
+            ("slite", index_slite),
+            ("meetings", index_meetings),
+        )
+        if wanted
+    ]
+    if credential_sources:
+        from check_credentials import check_sources, format_results
+
+        print()
+        print("Checking API credentials...")
+        credential_results = check_sources(credential_sources)
+        credential_failures = format_results(credential_results)
+
+        # Skip a source whose credential is already known bad, rather than
+        # letting it make doomed API calls and then report zero items. Leaving
+        # it enabled would also double-report: once here and again from
+        # resolve_sources_to_update's skipped-source list. Its chunks are
+        # preserved either way — the wipe list is built from what collected.
+        for source, (ok, _detail) in credential_results.items():
+            if ok:
+                continue
+            if source == "jira":
+                index_jira = False
+            elif source == "slack":
+                index_slack = False
+            elif source == "slite":
+                index_slite = False
+            elif source == "meetings":
+                index_meetings = False
+
+        for failure in credential_failures:
+            run_warnings.append(
+                f"{failure} — source skipped before indexing; existing chunks "
+                "preserved"
+            )
 
     # Check dependencies
     try:
@@ -972,6 +1069,11 @@ Examples:
             )
         else:
             print("  ⚠️  No Jira issues collected")
+            run_warnings.append(
+                "Jira: 0 issues collected — the API token may be expired or "
+                "Jira may be unreachable. Check JIRA_API_TOKEN in "
+                "~/.secrets.env. Existing Jira chunks were preserved this run."
+            )
 
     # Source 6: Slack (team conversations via API)
     if index_slack and SLACK_TOKEN_FILE and SLACK_CHANNELS_FILE and SLACK_CHANNELS:
@@ -997,6 +1099,12 @@ Examples:
             )
         else:
             print("  ⚠️  No Slack messages collected")
+            run_warnings.append(
+                "Slack: 0 messages collected — the MCP bridge to the claude.ai "
+                "Slack connector may be failing, or the channel roster at "
+                "config/channels.json may be stale. Existing Slack chunks were "
+                "preserved this run."
+            )
 
     # Source 7: Slite (team knowledge via REST API)
     if index_slite and SLITE_API_KEY and SLITE_ROOT_NOTE_IDS:
@@ -1014,6 +1122,11 @@ Examples:
             print(f"  ✓ Collected {len(docs)} Slite notes")
         else:
             print("  ⚠️  No Slite notes collected")
+            run_warnings.append(
+                "Slite: 0 notes collected — likely API rate limiting (429) or "
+                "an expired SLITE_API_KEY in ~/.secrets.env. Existing Slite "
+                "chunks were preserved this run."
+            )
 
     if index_meetings and MEETING_DOCS_ENABLED:
         print("  Collecting meeting docs from Google Drive...")
@@ -1028,6 +1141,10 @@ Examples:
             # resolve_sources_to_update leaves the existing chunks alone when a
             # source collects nothing.
             print(f"  ⚠️  Meeting docs skipped -- {drive_auth_error}")
+            run_warnings.append(
+                f"Meetings: {drive_auth_error} Existing meeting chunks were "
+                "preserved this run."
+            )
             meeting_chunks = []
 
         if meeting_chunks:
@@ -1038,6 +1155,12 @@ Examples:
             print(f"  ✓ Collected {len(docs)} meeting chunks")
         else:
             print("  ⚠️  No meeting chunks collected")
+            run_warnings.append(
+                "Meetings: 0 chunks collected — Drive returned no matching "
+                f"docs for {MEETING_DOC_QUERY!r}, or the shared google-docs "
+                "MCP credential was revoked. Existing meeting chunks were "
+                "preserved this run."
+            )
 
     # Future sources:
     # process_files = collect_process_docs()
@@ -1080,12 +1203,22 @@ Examples:
         all_metadatas, requested_sources
     )
     if skipped_sources:
-        print(
-            "⚠️  Collected 0 chunks for requested source(s): "
+        message = (
+            "Collected 0 chunks for requested source(s): "
             f"{', '.join(skipped_sources)} — leaving their existing chunks in "
             "place (NOT wiping). Investigate the collector before trusting the "
             "next run."
         )
+        print(f"⚠️  {message}")
+        # Route the guardrail's own finding into the alert path. Printing it is
+        # what let the archived-slack-tools breakage run unnoticed: the wipe was
+        # correctly skipped, but the message went to a launchd log nobody reads.
+        # A source that collects nothing is exactly the silent failure the
+        # modal exists for.
+        if not any(
+            source in warning for warning in run_warnings for source in skipped_sources
+        ):
+            run_warnings.append(message)
 
     # Index (optionally wrapped in a Matrix-rain live display).
     import contextlib
@@ -1128,8 +1261,39 @@ Examples:
         print_index_summary(all_metadatas, index_time)
         print("\nCollection 'unified_knowledge' ready for querying")
 
+    # Surface any human-actionable failures out-of-band. The run still
+    # "succeeds" (other sources indexed fine), but the user needs to know a
+    # source silently dropped out so they can act on it.
+    if run_warnings:
+        for warning in run_warnings:
+            print(f"\n⚠️  {warning}")
+        summary = f"{len(run_warnings)} source(s) failed to ingest. " + run_warnings[0]
+        notify_macos("RAG indexer: source ingestion failed", summary)
+
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # The notify_macos() call inside main() only covers a source failing to
+    # ingest during a run that otherwise finished. A crash never reached it:
+    # Qdrant unreachable, disk full, a bad import — the run died here with a
+    # stack trace in a log file nobody reads, so the unattended 8am launchd job
+    # failed silently every morning for weeks (exit status 1, no modal, and the
+    # index quietly went stale). Any unhandled exception now pops the same
+    # modal the ingest warnings do.
+    #
+    # Catching Exception rather than BaseException is deliberate: SystemExit
+    # (the normal return path) and KeyboardInterrupt (Ctrl-C on a manual run)
+    # must pass through without popping a dialog.
+    try:
+        sys.exit(main())
+    except Exception as crash:
+        traceback.print_exc()
+        detail = f"{type(crash).__name__}: {crash}"
+        if len(detail) > 300:
+            detail = detail[:297] + "..."
+        notify_macos(
+            "RAG indexer: run failed — index NOT updated",
+            f"{detail}\n\nFull traceback: " "~/Library/Logs/bamboohr-rag-indexer.log",
+        )
+        sys.exit(1)

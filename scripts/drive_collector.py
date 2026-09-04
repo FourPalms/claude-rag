@@ -78,7 +78,9 @@ def _load_credentials() -> Tuple[str, str, str]:
             elif arg.startswith("GOOGLE_CLIENT_SECRET="):
                 client_secret = arg.split("=", 1)[1]
     if not (client_id and client_secret):
-        raise DriveAuthError("Could not resolve GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET")
+        raise DriveAuthError(
+            "Could not resolve GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET"
+        )
     return client_id, client_secret, refresh_token
 
 
@@ -118,7 +120,9 @@ def _check(response: requests.Response, what: str) -> Dict:
             "+ documents.readonly) and point this collector at its token."
         )
     if response.status_code != 200:
-        raise RuntimeError(f"{what} failed ({response.status_code}): {response.text[:200]}")
+        raise RuntimeError(
+            f"{what} failed ({response.status_code}): {response.text[:200]}"
+        )
     return response.json()
 
 
@@ -181,7 +185,7 @@ def _paragraph_to_markdown(paragraph: Dict) -> str:
         if run.get("textStyle", {}).get("bold"):
             # Keep trailing whitespace outside the emphasis markers.
             stripped = text.strip()
-            trailing = text[len(text.rstrip()):]
+            trailing = text[len(text.rstrip()) :]
             pieces.append(f"**{stripped}**{trailing}")
         else:
             pieces.append(text)
@@ -288,8 +292,10 @@ def collect_drive_meetings(
     """
     token = _access_token()
     docs = _list_meeting_docs(token, name_contains, modified_after, max_docs)
-    print(f"  Found {len(docs)} meeting doc(s) matching {name_contains!r}"
-          + (f" modified after {modified_after}" if modified_after else ""))
+    print(
+        f"  Found {len(docs)} meeting doc(s) matching {name_contains!r}"
+        + (f" modified after {modified_after}" if modified_after else "")
+    )
 
     chunks: List[Dict] = []
     skipped = 0
@@ -299,7 +305,9 @@ def collect_drive_meetings(
             tabs = _fetch_doc_tabs(token, doc_id)
         except DriveAuthError:
             raise
-        except Exception as fetch_exception:  # noqa: BLE001 - one bad doc must not stop the run
+        except (
+            Exception
+        ) as fetch_exception:  # noqa: BLE001 - one bad doc must not stop the run
             print(f"  ⚠️  [{index}/{len(docs)}] {name}: {fetch_exception}")
             skipped += 1
             continue
@@ -327,6 +335,8 @@ def collect_drive_meetings(
         if index % 25 == 0 or index == len(docs):
             print(f"  … {index}/{len(docs)} docs, {len(chunks)} chunks so far")
 
-    print(f"  ✓ {len(chunks)} chunks from {len(docs) - skipped} doc(s)"
-          + (f", {skipped} skipped" if skipped else ""))
+    print(
+        f"  ✓ {len(chunks)} chunks from {len(docs) - skipped} doc(s)"
+        + (f", {skipped} skipped" if skipped else "")
+    )
     return chunks

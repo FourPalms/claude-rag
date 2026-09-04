@@ -67,6 +67,9 @@ LINT_FILES := \
 	$(SCRIPTS)/jsonl_session_chunker.py \
 	$(SCRIPTS)/jira_collector.py \
 	$(SCRIPTS)/slack_collector.py \
+	$(SCRIPTS)/drive_collector.py \
+	$(SCRIPTS)/transcript_chunker.py \
+	$(SCRIPTS)/check_credentials.py \
 	$(SCRIPTS)/query.py \
 	$(SCRIPTS)/list_docs.py \
 	$(SCRIPTS)/show_stats.py \

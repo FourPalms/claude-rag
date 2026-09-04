@@ -85,7 +85,11 @@ def _chunk_attribution(text: str, doc_level: str, subject: str = "") -> str:
     verdict (which carries the `inferred` marker) apply.
     """
     if subject:
-        return "room" if (ROOM_RE.match(subject) or ROOM_LABEL_RE.search(subject)) else "labeled"
+        return (
+            "room"
+            if (ROOM_RE.match(subject) or ROOM_LABEL_RE.search(subject))
+            else "labeled"
+        )
     if ROOM_LABEL_RE.search(text):
         return "room"
     return doc_level
@@ -111,11 +115,13 @@ def parse_turns(transcript: str) -> List[Dict]:
             continue
         match = TURN_RE.match(line.strip())
         if match:
-            turns.append({
-                "speaker": match.group(1).strip(),
-                "text": match.group(2).strip(),
-                "ts": current_ts,
-            })
+            turns.append(
+                {
+                    "speaker": match.group(1).strip(),
+                    "text": match.group(2).strip(),
+                    "ts": current_ts,
+                }
+            )
         elif turns and line.strip():
             # Continuation of the previous turn's paragraph.
             turns[-1]["text"] = (turns[-1]["text"] + " " + line.strip()).strip()
@@ -142,33 +148,36 @@ def chunk_transcript(transcript: str, base: Dict) -> List[Dict]:
         speakers = sorted({t["speaker"] for t in buffer})
         group_attribution = (
             "room"
-            if speakers and all(
-                ROOM_RE.match(s) or ROOM_LABEL_RE.search(s) for s in speakers
-            )
+            if speakers
+            and all(ROOM_RE.match(s) or ROOM_LABEL_RE.search(s) for s in speakers)
             else attribution
         )
         ts_start = next((t["ts"] for t in buffer if t["ts"]), "")
         header = f"# {base.get('title', 'Meeting')} — {base.get('meeting_date', '')}"
         if ts_start:
             header += f" @ {ts_start}"
-        chunks.append({
-            "content": f"{header}\n\n{body}",
-            "metadata": {
-                **base,
-                "chunk_type": "transcript_turn_group",
-                "ts_start": ts_start,
-                "speakers": ", ".join(speakers),
-                "speaker_attribution": group_attribution,
-                "turn_count": len(buffer),
-            },
-        })
+        chunks.append(
+            {
+                "content": f"{header}\n\n{body}",
+                "metadata": {
+                    **base,
+                    "chunk_type": "transcript_turn_group",
+                    "ts_start": ts_start,
+                    "speakers": ", ".join(speakers),
+                    "speaker_attribution": group_attribution,
+                    "turn_count": len(buffer),
+                },
+            }
+        )
         buffer.clear()
 
     size = 0
     for turn in turns:
         turn_len = len(turn["speaker"]) + len(turn["text"]) + 2
         starts_new_ts = bool(turn["ts"]) and buffer and turn["ts"] != buffer[-1]["ts"]
-        if buffer and (size + turn_len > MAX_CHARS or (starts_new_ts and size >= TARGET_CHARS)):
+        if buffer and (
+            size + turn_len > MAX_CHARS or (starts_new_ts and size >= TARGET_CHARS)
+        ):
             flush()
             size = 0
         buffer.append(turn)
@@ -204,11 +213,15 @@ def chunk_full_notes(notes: str, base: Dict) -> List[Dict]:
     chunks: List[Dict] = []
     owners = [
         match.group(1).strip()
-        for match in (re.match(r"^\[([^\]]+)\]", item)
-                      for item in _list_items(_section(notes, "Next steps")))
+        for match in (
+            re.match(r"^\[([^\]]+)\]", item)
+            for item in _list_items(_section(notes, "Next steps"))
+        )
         if match
     ]
-    attribution = "inferred" if _detect_attribution(notes, []) == "inferred" else "labeled"
+    attribution = (
+        "inferred" if _detect_attribution(notes, []) == "inferred" else "labeled"
+    )
     title = base.get("title", "Meeting")
     date = base.get("meeting_date", "")
 
@@ -218,49 +231,55 @@ def chunk_full_notes(notes: str, base: Dict) -> List[Dict]:
         # so the highest-value chunk is actually readable.
         summary = re.sub(r"\*\*(.+?)\*\*", r"\n\n**\1**\n", summary).strip()
         summary = re.sub(r"\n{3,}", "\n\n", summary)
-        chunks.append({
-            "content": f"# {title} — {date}\n\nMeeting summary:\n\n{summary}",
-            "metadata": {
-                **base,
-                "chunk_type": "meeting_summary",
-                # A summary covering a mixed meeting inherits the room label only
-                # if the room is what the summary talks about.
-                "speaker_attribution": _chunk_attribution(summary, attribution),
-            },
-        })
+        chunks.append(
+            {
+                "content": f"# {title} — {date}\n\nMeeting summary:\n\n{summary}",
+                "metadata": {
+                    **base,
+                    "chunk_type": "meeting_summary",
+                    # A summary covering a mixed meeting inherits the room label only
+                    # if the room is what the summary talks about.
+                    "speaker_attribution": _chunk_attribution(summary, attribution),
+                },
+            }
+        )
 
     for index, item in enumerate(_list_items(_section(notes, "Next steps"))):
         owner_match = re.match(r"^\[([^\]]+)\]\s*(.*)$", item)
         owner = owner_match.group(1).strip() if owner_match else ""
         body = owner_match.group(2).strip() if owner_match else item
-        chunks.append({
-            "content": f"# {title} — {date}\n\nAction item"
-                       + (f" ({owner})" if owner else "")
-                       + f": {body}",
-            "metadata": {
-                **base,
-                "chunk_type": "meeting_action_item",
-                "owner": owner,
-                "item_index": index,
-                "speaker_attribution": _chunk_attribution(body, attribution, owner),
-            },
-        })
+        chunks.append(
+            {
+                "content": f"# {title} — {date}\n\nAction item"
+                + (f" ({owner})" if owner else "")
+                + f": {body}",
+                "metadata": {
+                    **base,
+                    "chunk_type": "meeting_action_item",
+                    "owner": owner,
+                    "item_index": index,
+                    "speaker_attribution": _chunk_attribution(body, attribution, owner),
+                },
+            }
+        )
 
     for index, item in enumerate(_list_items(_section(notes, "Details"))):
         anchor = ANCHOR_RE.search(item)
         ts = anchor.group(1) if anchor else ""
-        chunks.append({
-            "content": f"# {title} — {date}"
-                       + (f" @ {ts}" if ts else "")
-                       + f"\n\n{item}",
-            "metadata": {
-                **base,
-                "chunk_type": "meeting_topic",
-                "ts_start": ts,
-                "topic_index": index,
-                "speaker_attribution": _chunk_attribution(item, attribution),
-            },
-        })
+        chunks.append(
+            {
+                "content": f"# {title} — {date}"
+                + (f" @ {ts}" if ts else "")
+                + f"\n\n{item}",
+                "metadata": {
+                    **base,
+                    "chunk_type": "meeting_topic",
+                    "ts_start": ts,
+                    "topic_index": index,
+                    "speaker_attribution": _chunk_attribution(item, attribution),
+                },
+            }
+        )
 
     return chunks
 

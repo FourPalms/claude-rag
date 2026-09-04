@@ -62,6 +62,12 @@ SLACK_CHANNELS = {
 # Slite (optional) — team knowledge base via REST API
 SLITE_API_KEY       = os.getenv("SLITE_API_KEY")
 SLITE_ROOT_NOTE_IDS = ["your-root-note-id"]
+
+# Meeting docs (optional) — Gemini's Google Doc for every Google Meet.
+# Auth reuses the google-docs MCP server's OAuth client and refresh token.
+MEETING_DOCS_ENABLED = True
+MEETING_DOC_QUERY    = "Notes by Gemini"
+MEETING_MAX_DOCS     = 500
 ```
 
 Slack can be ingested either through the Slack API directly or through the
@@ -80,12 +86,29 @@ To re-index a single source without rebuilding everything:
 ```bash
 python3 scripts/unified_indexer.py --sources jira
 python3 scripts/unified_indexer.py --sources code sessions
-# Available: sanctum archive code js_ts puppet sessions jira slack slite
+# Available: sanctum archive code js_ts puppet sessions jira slack slite meetings
 ```
 
 Code repos are synced to their primary branch before indexing by default; pass
 `--no-sync` to index the working tree as-is (used by the nightly job so a dirty
 or off-branch checkout never blocks the run).
+
+### Scheduling
+
+`scripts/run_indexer.sh` is the launchd entry point for the daily run. It exists
+so a stalled run cannot silently stop the schedule: launchd will not start a new
+instance while the previous one is alive, so a run that hangs on a stuck socket
+blocks every subsequent day. The wrapper caps the run with `timeout` (2h default
+against a measured ~46m full index) and pops an alert when that cap trips —
+a process killed from outside cannot report on itself.
+
+```bash
+sh scripts/run_indexer.sh --sources code sessions   # args pass through
+RAG_INDEXER_MAX_SECONDS=5 sh scripts/run_indexer.sh # exercise the timeout path
+```
+
+`RAG_INDEXER_TIMEOUT_BIN` and `RAG_INDEXER_PYTHON` override the absolute binary
+paths, which are absolute because launchd runs with a minimal PATH.
 
 ### 5. Register with Claude Code
 
@@ -282,6 +305,10 @@ before ranking.
 │   ├── slack_collector.py         # Slack API fetcher (thread-aware)
 │   ├── slack_mcp_bridge.py        # Bridge to Claude Code's official Slack MCP connector
 │   ├── slite_collector.py         # Slite REST API fetcher
+│   ├── drive_collector.py         # Google Drive meeting-doc fetcher (Drive v3 + Docs v1)
+│   ├── transcript_chunker.py      # Meeting notes/transcript chunking + speaker attribution
+│   ├── check_credentials.py       # Preflight credential probes for API-backed sources
+│   ├── run_indexer.sh             # launchd wrapper: wall-clock cap + timeout alert
 │   ├── index_sanctum.py           # Sanctum knowledge-base indexer
 │   ├── matrix_display.py          # Matrix-rain live indexer display
 │   ├── query.py                   # Semantic search CLI interface
