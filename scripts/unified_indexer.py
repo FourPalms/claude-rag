@@ -17,10 +17,11 @@ import time
 import uuid
 import hashlib
 import argparse
+import json
 import subprocess
 import traceback
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 
 
@@ -64,6 +65,13 @@ def notify_macos(title: str, message: str) -> None:
 # Namespace for deterministic point IDs. Any fixed UUID works; we pin one
 # here so IDs are stable across runs, machines, and Python versions.
 _POINT_ID_NAMESPACE = uuid.UUID("6f1e8a7b-4c2d-4e0f-9b1a-0d2e3f4a5b6c")
+
+# Watermark for the incremental meeting-doc pull. Lives beside the other
+# per-source state files (config/ is gitignored for tokens; this is state,
+# not config, and is safe to lose -- losing it costs one full pull).
+MEETINGS_STATE_FILE = (
+    Path(__file__).resolve().parent.parent / "config" / "meetings_last_checked.json"
+)
 
 
 def make_point_id(metadata: Dict, document: str) -> str:
@@ -516,12 +524,47 @@ def load_meeting_docs(
     return documents, metadatas, ids
 
 
+def _read_watermark(state_file: Path) -> Optional[str]:
+    """
+    Return the RFC3339 timestamp of the last successful incremental run.
+
+    A missing, unreadable, or malformed state file returns None, which means a
+    full pull. Failing open matters: a corrupt watermark that parsed as a
+    recent date would silently skip documents forever.
+    """
+    try:
+        return json.loads(state_file.read_text()).get("last_modified") or None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_watermark(state_file: Path, docs_modified: List[str]) -> None:
+    """
+    Record the newest modifiedTime seen this run.
+
+    Deliberately the max of what was actually fetched, not "now": a document
+    edited while the run was in flight keeps a timestamp at or after the one
+    stored, so the next run still picks it up. Storing "now" would step over it.
+    """
+    newest = max((stamp for stamp in docs_modified if stamp), default=None)
+    if not newest:
+        return
+    try:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps({"last_modified": newest}, indent=2) + "\n")
+    except OSError as write_error:
+        # A watermark that cannot be written costs a full pull next time, which
+        # is slow but correct. Never fail the run over it.
+        print(f"  ⚠️  Could not write {state_file}: {write_error}")
+
+
 def index_unified_collection(
     documents: List[str],
     metadatas: List[Dict],
     ids: List[str],
     sources_to_update: List[str],
     display=None,
+    incremental_scopes: Optional[Dict[str, List[str]]] = None,
 ):
     """
     Create or update the unified knowledge collection.
@@ -544,6 +587,7 @@ def index_unified_collection(
         Filter,
         FieldCondition,
         MatchAny,
+        MatchValue,
         FilterSelector,
         PointStruct,
     )
@@ -591,17 +635,50 @@ def index_unified_collection(
     else:
         print(f"Using existing '{collection_name}' collection")
 
-        # Delete old chunks from sources being updated using filtered delete
-        if sources_to_update:
-            print(f"Removing old chunks from sources: {', '.join(sources_to_update)}")
+        # Delete old chunks from sources being updated using filtered delete.
+        #
+        # A source that collected INCREMENTALLY must not be wiped wholesale: it
+        # only re-fetched the documents that changed, so a source-wide delete
+        # would drop every document it did not look at this run. Such a source
+        # supplies the document ids it refreshed, and only those are purged --
+        # which still clears the stale chunks of a document whose content
+        # changed, because point ids key off content and the old ones would
+        # otherwise be orphaned.
+        scopes = incremental_scopes or {}
+        full_wipe = [s for s in sources_to_update if s not in scopes]
+        scoped = [s for s in sources_to_update if s in scopes]
+
+        if full_wipe:
+            print(f"Removing old chunks from sources: {', '.join(full_wipe)}")
+            client.delete(
+                collection_name=collection_name,
+                points_selector=FilterSelector(
+                    filter=Filter(
+                        must=[
+                            FieldCondition(key="source", match=MatchAny(any=full_wipe))
+                        ]
+                    )
+                ),
+                wait=True,
+            )
+
+        for source in scoped:
+            doc_ids = scopes[source]
+            if not doc_ids:
+                continue
+            print(
+                f"Removing old chunks from {source}: "
+                f"{len(doc_ids)} refreshed document(s) only"
+            )
             client.delete(
                 collection_name=collection_name,
                 points_selector=FilterSelector(
                     filter=Filter(
                         must=[
                             FieldCondition(
-                                key="source", match=MatchAny(any=sources_to_update)
-                            )
+                                key="source", match=MatchValue(value=source)
+                            ),
+                            FieldCondition(key="doc_id", match=MatchAny(any=doc_ids)),
                         ]
                     )
                 ),
@@ -788,6 +865,11 @@ Examples:
         ],
         default=["all"],
         help="Which sources to index (default: all)",
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Ignore incremental watermarks and re-fetch every document.",
     )
     parser.add_argument(
         "--matrix",
@@ -1128,12 +1210,23 @@ Examples:
                 "chunks were preserved this run."
             )
 
+    meetings_refreshed_doc_ids: List[str] = []
+    meetings_modified: List[str] = []
     if index_meetings and MEETING_DOCS_ENABLED:
         print("  Collecting meeting docs from Google Drive...")
+        # Fetching a document is ~0.9s (one Docs API call per doc), so a full
+        # pull dominates the run -- 10+ minutes at full corpus size against
+        # ~4 minutes of embedding. The watermark limits the pull to documents
+        # modified since the last successful run. --rebuild ignores it.
+        meetings_state = MEETINGS_STATE_FILE
+        modified_after = None if args.rebuild else _read_watermark(meetings_state)
+        if modified_after:
+            print(f"  (incremental: documents modified after {modified_after})")
         try:
             meeting_chunks = collect_drive_meetings(
                 name_contains=MEETING_DOC_QUERY,
                 max_docs=MEETING_MAX_DOCS,
+                modified_after=modified_after,
             )
         except DriveAuthError as drive_auth_error:
             # Credentials are shared with the google-docs MCP server, so a
@@ -1152,6 +1245,12 @@ Examples:
             all_documents.extend(docs)
             all_metadatas.extend(metas)
             all_ids.extend(ids)
+            # Only the documents refreshed this run may be purged; everything
+            # else in source=meetings must survive an incremental pull.
+            meetings_refreshed_doc_ids = sorted(
+                {m["doc_id"] for m in metas if m.get("doc_id")}
+            )
+            meetings_modified = [m.get("modified_at", "") for m in metas]
             print(f"  ✓ Collected {len(docs)} meeting chunks")
         else:
             print("  ⚠️  No meeting chunks collected")
@@ -1220,6 +1319,17 @@ Examples:
         ):
             run_warnings.append(message)
 
+    # Meetings pulled incrementally: scope its purge to the refreshed documents.
+    # A full pull (--rebuild, or a first run with no watermark) leaves the scope
+    # empty so the source is wiped and replaced wholesale, as before.
+    incremental_scopes = {}
+    if (
+        meetings_refreshed_doc_ids
+        and not args.rebuild
+        and _read_watermark(MEETINGS_STATE_FILE)
+    ):
+        incremental_scopes["meetings"] = meetings_refreshed_doc_ids
+
     # Index (optionally wrapped in a Matrix-rain live display).
     import contextlib
     import io
@@ -1245,6 +1355,7 @@ Examples:
                 all_ids,
                 sources_being_updated,
                 display=display,
+                incremental_scopes=incremental_scopes,
             )
             count_result = client.count(collection_name="unified_knowledge", exact=True)
         # After the matrix context exits the terminal is restored; print the
@@ -1254,12 +1365,19 @@ Examples:
         print("\nCollection 'unified_knowledge' ready for querying")
     else:
         client, index_time = index_unified_collection(
-            all_documents, all_metadatas, all_ids, sources_being_updated
+            all_documents,
+            all_metadatas,
+            all_ids,
+            sources_being_updated,
+            incremental_scopes=incremental_scopes,
         )
         count_result = client.count(collection_name="unified_knowledge", exact=True)
         print(f"✓ Collection now contains {count_result.count} total chunks")
         print_index_summary(all_metadatas, index_time)
         print("\nCollection 'unified_knowledge' ready for querying")
+
+    if meetings_modified and "meetings" in sources_being_updated:
+        _write_watermark(MEETINGS_STATE_FILE, meetings_modified)
 
     # Surface any human-actionable failures out-of-band. The run still
     # "succeeds" (other sources indexed fine), but the user needs to know a

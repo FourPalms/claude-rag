@@ -324,6 +324,11 @@ def collect_drive_meetings(
             "title": name.split(" - Notes by Gemini")[0].strip(),
             "meeting_date": "-".join(date_match.groups()) if date_match else "",
             "modified": (doc.get("modifiedTime") or "")[:10],
+            # Full RFC3339, kept alongside the display date because the
+            # incremental watermark needs sub-day precision -- Drive reads a
+            # bare date as midnight, so a date-only watermark re-fetches the
+            # whole most-recent day on every run.
+            "modified_at": doc.get("modifiedTime") or "",
             # Named doc_owner, not owner: meeting_action_item chunks use `owner`
             # for the action's assignee, and a shared key would silently collide.
             "doc_owner": (doc.get("owners") or [{}])[0].get("emailAddress", ""),
