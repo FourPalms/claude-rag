@@ -88,6 +88,9 @@ from config import (
     SLACK_CHANNELS,
     SLITE_API_KEY,
     SLITE_ROOT_NOTE_IDS,
+    MEETING_DOCS_ENABLED,
+    MEETING_DOC_QUERY,
+    MEETING_MAX_DOCS,
 )
 
 # Import collectors
@@ -100,6 +103,7 @@ from jira_collector import collect_jira_issues
 from slack_collector import collect_slack_messages
 from slite_collector import collect_slite_docs
 from puppet_collector import collect_puppet_code
+from drive_collector import collect_drive_meetings, DriveAuthError
 
 
 def collect_sanctum_docs() -> List[Tuple[Path, str]]:
@@ -446,6 +450,32 @@ def load_slite_docs(
     return documents, metadatas, ids
 
 
+def load_meeting_docs(
+    meeting_chunks: List[Dict],
+) -> Tuple[List[str], List[Dict], List[str]]:
+    """
+    Load meeting-doc chunks (complex: one Google Doc = many chunks).
+
+    Chunks arrive already typed by transcript_chunker as meeting_summary,
+    meeting_action_item, meeting_topic, or transcript_turn_group, and each
+    carries speaker_attribution recording how much to trust its speaker labels.
+    Returns (documents, metadatas, ids).
+    """
+    documents = []
+    metadatas = []
+    ids = []
+
+    for i, chunk in enumerate(meeting_chunks):
+        documents.append(chunk["content"])
+
+        metadata = {"source": "meetings", "doc_type": "gdoc", **chunk["metadata"]}
+
+        metadatas.append(metadata)
+        ids.append(f"meetings_chunk_{i}")
+
+    return documents, metadatas, ids
+
+
 def index_unified_collection(
     documents: List[str],
     metadatas: List[Dict],
@@ -713,6 +743,7 @@ Examples:
             "jira",
             "slack",
             "slite",
+            "meetings",
             "all",
         ],
         default=["all"],
@@ -740,6 +771,7 @@ Examples:
     index_jira = index_all or "jira" in args.sources
     index_slack = index_all or "slack" in args.sources
     index_slite = index_all or "slite" in args.sources
+    index_meetings = index_all or "meetings" in args.sources
     index_puppet = index_all or "puppet" in args.sources
 
     print("Unified RAG Indexer")
@@ -983,6 +1015,30 @@ Examples:
         else:
             print("  ⚠️  No Slite notes collected")
 
+    if index_meetings and MEETING_DOCS_ENABLED:
+        print("  Collecting meeting docs from Google Drive...")
+        try:
+            meeting_chunks = collect_drive_meetings(
+                name_contains=MEETING_DOC_QUERY,
+                max_docs=MEETING_MAX_DOCS,
+            )
+        except DriveAuthError as drive_auth_error:
+            # Credentials are shared with the google-docs MCP server, so a
+            # revoke or re-consent there lands here. Surface it and carry on:
+            # resolve_sources_to_update leaves the existing chunks alone when a
+            # source collects nothing.
+            print(f"  ⚠️  Meeting docs skipped -- {drive_auth_error}")
+            meeting_chunks = []
+
+        if meeting_chunks:
+            docs, metas, ids = load_meeting_docs(meeting_chunks)
+            all_documents.extend(docs)
+            all_metadatas.extend(metas)
+            all_ids.extend(ids)
+            print(f"  ✓ Collected {len(docs)} meeting chunks")
+        else:
+            print("  ⚠️  No meeting chunks collected")
+
     # Future sources:
     # process_files = collect_process_docs()
     # agent_research_files = collect_agent_research_docs()
@@ -1014,6 +1070,8 @@ Examples:
         requested_sources.append("slite")
     if index_puppet:
         requested_sources.append("puppet")
+    if index_meetings:
+        requested_sources.append("meetings")
 
     # Only wipe-and-replace sources that actually produced chunks this run;
     # preserve (don't wipe) any requested source that collected 0 chunks. See
