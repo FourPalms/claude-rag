@@ -134,7 +134,12 @@ def chunk_transcript(transcript: str, base: Dict) -> List[Dict]:
     if not turns:
         return []
 
-    attribution = _detect_attribution(transcript, [t["speaker"] for t in turns])
+    # Document level carries only inferred-vs-labeled. A whole-transcript
+    # room scan here would taint every group in a mixed meeting, where some
+    # attendees share a room and others are in their own windows.
+    doc_level = (
+        "inferred" if _detect_attribution(transcript, []) == "inferred" else "labeled"
+    )
     chunks: List[Dict] = []
     buffer: List[Dict] = []
 
@@ -146,11 +151,13 @@ def chunk_transcript(transcript: str, base: Dict) -> List[Dict]:
             buffer.clear()
             return
         speakers = sorted({t["speaker"] for t in buffer})
+        # `any`, not `all`: a group mixing a named person with the room still
+        # contains statements that cannot be attributed. The Speakers line shows
+        # the reader which is which.
         group_attribution = (
             "room"
-            if speakers
-            and all(ROOM_RE.match(s) or ROOM_LABEL_RE.search(s) for s in speakers)
-            else attribution
+            if any(ROOM_RE.match(s) or ROOM_LABEL_RE.search(s) for s in speakers)
+            else doc_level
         )
         ts_start = next((t["ts"] for t in buffer if t["ts"]), "")
         header = f"# {base.get('title', 'Meeting')} — {base.get('meeting_date', '')}"
