@@ -35,14 +35,17 @@ if [ ! -x "$TIMEOUT_BIN" ]; then
 	# so — an uncapped run can hang, which is the failure this wrapper exists
 	# to prevent.
 	echo "WARNING: $TIMEOUT_BIN not found; running without a wall-clock cap."
-	"$PYTHON_BIN" scripts/unified_indexer.py "$@"
+	"$PYTHON_BIN" -u scripts/unified_indexer.py "$@"
 	exit $?
 fi
 
 # -k: if the run ignores TERM at the cap, follow up with KILL after the grace.
 # Any arguments given to this wrapper are forwarded to the indexer, which is how
 # the plist selects which sources to index.
-"$TIMEOUT_BIN" -k "$GRACE_SECONDS" "$MAX_SECONDS" "$PYTHON_BIN" scripts/unified_indexer.py "$@"
+#
+# -u so a run killed at the cap doesn't lose its unflushed tail: launchd
+# redirects stdout to a file, which makes Python block-buffer it.
+"$TIMEOUT_BIN" -k "$GRACE_SECONDS" "$MAX_SECONDS" "$PYTHON_BIN" -u scripts/unified_indexer.py "$@"
 rc=$?
 
 # 124 is timeout(1)'s signal that it killed the child at the cap.
