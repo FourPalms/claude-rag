@@ -25,6 +25,11 @@ from collections import defaultdict
 # here so IDs are stable across runs, machines, and Python versions.
 _POINT_ID_NAMESPACE = uuid.UUID("6f1e8a7b-4c2d-4e0f-9b1a-0d2e3f4a5b6c")
 
+# fastembed defaults its model cache to tempfile.gettempdir(); macOS purges that
+# and the next run dies at model load. Path comes from __file__, not config.py,
+# because config.py is gitignored. Mirrors search.py.
+FASTEMBED_CACHE_DIR = str(Path(__file__).resolve().parent.parent / ".fastembed_cache")
+
 
 def make_point_id(metadata: Dict, document: str) -> str:
     """
@@ -485,7 +490,10 @@ def index_unified_collection(
 
     # Initialize dense embedding model (FastEmbed with ONNX for faster cold starts)
     print("Loading embedding model...")
-    model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    model = TextEmbedding(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        cache_dir=FASTEMBED_CACHE_DIR,
+    )
     embedding_size = 384  # all-MiniLM-L6-v2 dimension
 
     # Compute corpus-average chunk length (whitespace-split token count) for BM25 scoring.
@@ -494,7 +502,12 @@ def index_unified_collection(
     # module singleton pattern would carry a stale avg_len across partial re-indexes.
     avg_len = sum(len(doc.split()) for doc in documents) / max(len(documents), 1)
     print(f"BM25 avg_len computed from corpus: {avg_len:.1f} tokens/chunk")
-    sparse_model = Bm25(model_name="Qdrant/bm25", language="english", avg_len=avg_len)
+    sparse_model = Bm25(
+        model_name="Qdrant/bm25",
+        language="english",
+        avg_len=avg_len,
+        cache_dir=FASTEMBED_CACHE_DIR,
+    )
 
     collection_name = "unified_knowledge"
 
