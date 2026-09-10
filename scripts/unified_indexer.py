@@ -931,35 +931,71 @@ Examples:
         if wanted
     ]
     if credential_sources:
-        from check_credentials import check_sources, format_results
+        from check_credentials import (
+            check_sources,
+            format_results,
+            offline,
+            wait_for_network,
+        )
 
         print()
-        print("Checking API credentials...")
-        credential_results = check_sources(credential_sources)
-        credential_failures = format_results(credential_results)
 
-        # Skip a source whose credential is already known bad, rather than
-        # letting it make doomed API calls and then report zero items. Leaving
-        # it enabled would also double-report: once here and again from
-        # resolve_sources_to_update's skipped-source list. Its chunks are
-        # preserved either way — the wipe list is built from what collected.
-        for source, (ok, _detail) in credential_results.items():
-            if ok:
-                continue
-            if source == "jira":
-                index_jira = False
-            elif source == "slack":
-                index_slack = False
-            elif source == "slite":
-                index_slite = False
-            elif source == "meetings":
-                index_meetings = False
+        # Wait out a missing network before concluding anything about the
+        # credentials. launchd fires at a fixed hour into whatever state the
+        # laptop is in; on 2026-09-10 that was a car with no signal, and all
+        # three API checks failed DNS. Without this the run reports three
+        # expired tokens that were never expired.
+        online = wait_for_network(credential_sources)
 
-        for failure in credential_failures:
+        if not online:
+            # Nothing to learn from checking credentials with no route out, so
+            # skip straight to disabling the API sources. Local sources (code,
+            # sessions, sanctum) still index — they never needed the network.
+            print("  ✗ no network after retries — skipping API-backed sources")
+            index_jira = index_slack = index_slite = index_meetings = False
             run_warnings.append(
-                f"{failure} — source skipped before indexing; existing chunks "
-                "preserved"
+                "No network at run time: "
+                f"{', '.join(sorted(credential_sources))} skipped. Credentials "
+                "were not checked and are probably fine; existing chunks "
+                "preserved. Local sources indexed normally."
             )
+        else:
+            print("Checking API credentials...")
+            credential_results = check_sources(credential_sources)
+            credential_failures = format_results(credential_results)
+
+            # Skip a source whose credential is already known bad, rather than
+            # letting it make doomed API calls and then report zero items.
+            # Leaving it enabled would also double-report: once here and again
+            # from resolve_sources_to_update's skipped-source list. Its chunks
+            # are preserved either way — the wipe list is built from what
+            # collected.
+            for source, result in credential_results.items():
+                if result.ok:
+                    continue
+                if source == "jira":
+                    index_jira = False
+                elif source == "slack":
+                    index_slack = False
+                elif source == "slite":
+                    index_slite = False
+                elif source == "meetings":
+                    index_meetings = False
+
+            # A source that failed on transport when the network is otherwise
+            # up is a flaky or down API, not a dead token. Say which, so the
+            # alert points at the thing that actually needs doing.
+            transport_only = offline(credential_results)
+            for failure in credential_failures:
+                cause = (
+                    "could not be reached"
+                    if transport_only
+                    else "failed its credential check"
+                )
+                run_warnings.append(
+                    f"{failure} — source {cause}; skipped before indexing, "
+                    "existing chunks preserved"
+                )
 
     # Check dependencies
     try:

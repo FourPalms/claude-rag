@@ -74,7 +74,8 @@ LINT_FILES := \
 	$(SCRIPTS)/list_docs.py \
 	$(SCRIPTS)/show_stats.py \
 	$(TESTS)/test_parsers.py \
-	$(TESTS)/test_slack_collector_overrides.py
+	$(TESTS)/test_slack_collector_overrides.py \
+	$(TESTS)/test_credential_network_gate.py
 
 lint:
 	$(PYTHON) -m black --check $(LINT_FILES)
