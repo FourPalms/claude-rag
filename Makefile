@@ -67,11 +67,13 @@ LINT_FILES := \
 	$(SCRIPTS)/jsonl_session_chunker.py \
 	$(SCRIPTS)/jira_collector.py \
 	$(SCRIPTS)/slack_collector.py \
+	$(SCRIPTS)/slite_collector.py \
 	$(SCRIPTS)/query.py \
 	$(SCRIPTS)/list_docs.py \
 	$(SCRIPTS)/show_stats.py \
 	$(TESTS)/test_parsers.py \
-	$(TESTS)/test_slack_collector_overrides.py
+	$(TESTS)/test_slack_collector_overrides.py \
+	$(TESTS)/test_slite_retry.py
 
 lint:
 	$(PYTHON) -m black --check $(LINT_FILES)
