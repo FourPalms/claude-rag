@@ -101,3 +101,30 @@ SLITE_API_KEY = os.getenv("SLITE_API_KEY")
 SLITE_ROOT_NOTE_IDS = [
     # "abc123xyz",  # e.g. "My Team" folder root note ID
 ]
+
+# --- Meeting docs (Google Drive) -------------------------------------------
+# Gemini writes a Google Doc for every Google Meet. This source indexes the
+# "Full notes" tab (Summary / Next steps / Details) and the "Transcript" tab of
+# every Doc whose title contains MEETING_DOC_QUERY -- both Docs you own and
+# Docs shared with you.
+#
+# Auth: scripts/drive_collector.py reuses the OAuth client and refresh token
+# already present for the google-docs MCP server:
+#
+#     ~/.claude.json                            client id + secret
+#     ~/.config/google-docs-mcp/token.json      refresh token
+#
+# Override with GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET in the environment.
+# Sharing that credential means a revoke or re-consent on the MCP server also
+# breaks this collector, and this read-only job inherits whatever write scopes
+# the client was granted. A dedicated client scoped to drive.readonly +
+# documents.readonly is better hygiene; point the collector at its token file.
+#
+# Attribution caveat: when attendees share a conference room, Google Meet
+# labels all of them with the room name, so Gemini credits statements and
+# action items to the room rather than a person. Every chunk carries
+# speaker_attribution of "labeled", "inferred", or "room" -- surface that
+# rather than presenting a room-attributed quote as somebody's words.
+MEETING_DOCS_ENABLED = True
+MEETING_DOC_QUERY = "Notes by Gemini"
+MEETING_MAX_DOCS = 500

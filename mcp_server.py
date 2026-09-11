@@ -49,6 +49,7 @@ async def search_knowledge(
             - "sanctum"  — Team knowledge base (markdown)
             - "sessions" — Claude Code session transcripts (JSONL)
             - "archive"  — Archived session logs / old working memory
+            - "meetings" — Meeting docs (Gemini notes + transcripts from Meet)
             Any other value returns empty.
         doc_type: Restrict to a file/content type. Useful values:
             - "php", "py"           — under source="code"
@@ -56,6 +57,7 @@ async def search_knowledge(
             - "pp", "rb", "yaml", "yml" — under source="puppet"
             - "md"                  — markdown (sanctum, archive)
             - "jira", "slack", "jsonl" — set to the source name for those sources
+            - "gdoc"                — under source="meetings"
         chunk_type: Restrict to a chunk kind. Meaning depends on source:
             - jira:     "title", "description", "comment"
             - code:     "class", "function", "method"
@@ -64,6 +66,13 @@ async def search_knowledge(
             - sessions: "conversation_exchange"
             - puppet:   "class", "define", "file", "function", "hiera_data", "method", "module"
             - archive:  "session"
+            - meetings: "meeting_summary" (whole-meeting summary — the densest
+                        and usually the best first hit), "meeting_topic" (one
+                        discussion topic, carries a transcript timestamp),
+                        "meeting_action_item" (one next step, with its owner),
+                        "transcript_turn_group" (raw speaker turns — verbatim
+                        but noisy; prefer the first three unless you need the
+                        exact wording)
         project: Jira project key, e.g. "SKY" or "BUGS". Only matches Jira chunks.
             Implicitly narrows to source="jira" because no other source carries this field.
         issue_key: Exact Jira issue key, e.g. "SKY-988". Only matches Jira chunks
@@ -89,6 +98,10 @@ async def search_knowledge(
             project=project,
             issue_key=issue_key,
         )
+    except ConnectionError as e:
+        # Qdrant is down, not empty. Say so plainly so this doesn't get
+        # misdiagnosed as a lost index — no re-indexing is needed.
+        return f"RAG unavailable: {str(e)}"
     except ValueError as e:
         return f"Error: {str(e)}\n\nThe RAG index may not be initialized. Run unified_indexer.py first."
     except Exception as e:
@@ -147,6 +160,41 @@ async def search_knowledge(
                     output.append(f"   Function: {metadata['function_name']}")
                 if "class_name" in metadata:
                     output.append(f"   Class: {metadata['class_name']}")
+            elif doc_type_val == "gdoc":
+                output.append(
+                    f"   Type: meeting - {metadata.get('chunk_type', 'unknown')}"
+                )
+                if metadata.get("meeting_date"):
+                    output.append(f"   Meeting date: {metadata['meeting_date']}")
+                if metadata.get("ts_start"):
+                    output.append(
+                        f"   Transcript position: {metadata['ts_start']} "
+                        "(open the source doc to verify)"
+                    )
+                if metadata.get("owner"):
+                    output.append(f"   Action owner: {metadata['owner']}")
+                if metadata.get("speakers"):
+                    output.append(f"   Speakers: {metadata['speakers']}")
+
+                # Attribution is the one field a reader must not miss. Google
+                # Meet labels everyone sharing a conference room with the room
+                # name, so Gemini credits statements and action items to the
+                # room rather than a person. Presenting such a chunk as
+                # somebody's words invents a quote, so say so in the result
+                # itself -- a flag nobody sees protects nobody.
+                attribution = metadata.get("speaker_attribution")
+                if attribution == "room":
+                    output.append(
+                        "   ⚠️  ATTRIBUTION: speakers here are a CONFERENCE ROOM, "
+                        "not a person. Do not attribute anything in this chunk to "
+                        "an individual."
+                    )
+                elif attribution == "inferred":
+                    output.append(
+                        "   ⚠️  ATTRIBUTION: speaker labels were inferred from turn "
+                        "shape, not recorded by Meet. Treat them as proposed, not "
+                        "authoritative."
+                    )
             else:
                 output.append(f"   Type: {doc_type_val}")
 

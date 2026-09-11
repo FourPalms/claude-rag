@@ -17,13 +17,61 @@ import time
 import uuid
 import hashlib
 import argparse
+import json
+import subprocess
+import traceback
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
+
+
+def notify_macos(title: str, message: str) -> None:
+    """
+    Pop a modal alert dialog the user cannot miss. Best-effort; never raises.
+
+    The indexer runs unattended via launchd (StandardOut/Err go to a log file
+    the user never reads), so warnings printed to stdout go unseen. A banner
+    ('display notification') is the wrong tool here: it auto-dismisses in
+    seconds and is silently dropped when Script Editor's notification
+    permission is off — and 8am is exactly when nobody's watching the screen.
+    A modal 'display dialog' instead persists until dismissed, guaranteeing a
+    failed or destructive ingest is seen whenever the user returns.
+
+    Fired detached (Popen, no wait) so the blocking dialog never holds up or
+    delays the indexing run. To switch back to a non-intrusive banner, replace
+    the script below with: f'display notification "{safe_message}" with title
+    "{safe_title}"'.
+    """
+    # AppleScript string literals are double-quoted; collapse any double quotes
+    # in our text to single quotes so the -e argument stays well-formed.
+    safe_message = message.replace('"', "'")
+    safe_title = title.replace('"', "'")
+    script = (
+        f'display dialog "{safe_message}" with title "{safe_title}" '
+        'buttons {"OK"} default button "OK" with icon caution'
+    )
+    try:
+        subprocess.Popen(
+            ["osascript", "-e", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        # The alert is a courtesy, not a requirement — never let it break or
+        # delay the indexing run.
+        pass
+
 
 # Namespace for deterministic point IDs. Any fixed UUID works; we pin one
 # here so IDs are stable across runs, machines, and Python versions.
 _POINT_ID_NAMESPACE = uuid.UUID("6f1e8a7b-4c2d-4e0f-9b1a-0d2e3f4a5b6c")
+
+# Watermark for the incremental meeting-doc pull. Lives beside the other
+# per-source state files (config/ is gitignored for tokens; this is state,
+# not config, and is safe to lose -- losing it costs one full pull).
+MEETINGS_STATE_FILE = (
+    Path(__file__).resolve().parent.parent / "config" / "meetings_last_checked.json"
+)
 
 
 def make_point_id(metadata: Dict, document: str) -> str:
@@ -88,6 +136,9 @@ from config import (
     SLACK_CHANNELS,
     SLITE_API_KEY,
     SLITE_ROOT_NOTE_IDS,
+    MEETING_DOCS_ENABLED,
+    MEETING_DOC_QUERY,
+    MEETING_MAX_DOCS,
 )
 
 # Import collectors
@@ -100,6 +151,7 @@ from jira_collector import collect_jira_issues
 from slack_collector import collect_slack_messages
 from slite_collector import collect_slite_docs
 from puppet_collector import collect_puppet_code
+from drive_collector import collect_drive_meetings, DriveAuthError
 
 
 def collect_sanctum_docs() -> List[Tuple[Path, str]]:
@@ -446,12 +498,73 @@ def load_slite_docs(
     return documents, metadatas, ids
 
 
+def load_meeting_docs(
+    meeting_chunks: List[Dict],
+) -> Tuple[List[str], List[Dict], List[str]]:
+    """
+    Load meeting-doc chunks (complex: one Google Doc = many chunks).
+
+    Chunks arrive already typed by transcript_chunker as meeting_summary,
+    meeting_action_item, meeting_topic, or transcript_turn_group, and each
+    carries speaker_attribution recording how much to trust its speaker labels.
+    Returns (documents, metadatas, ids).
+    """
+    documents = []
+    metadatas = []
+    ids = []
+
+    for i, chunk in enumerate(meeting_chunks):
+        documents.append(chunk["content"])
+
+        metadata = {"source": "meetings", "doc_type": "gdoc", **chunk["metadata"]}
+
+        metadatas.append(metadata)
+        ids.append(f"meetings_chunk_{i}")
+
+    return documents, metadatas, ids
+
+
+def _read_watermark(state_file: Path) -> Optional[str]:
+    """
+    Return the RFC3339 timestamp of the last successful incremental run.
+
+    A missing, unreadable, or malformed state file returns None, which means a
+    full pull. Failing open matters: a corrupt watermark that parsed as a
+    recent date would silently skip documents forever.
+    """
+    try:
+        return json.loads(state_file.read_text()).get("last_modified") or None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_watermark(state_file: Path, docs_modified: List[str]) -> None:
+    """
+    Record the newest modifiedTime seen this run.
+
+    Deliberately the max of what was actually fetched, not "now": a document
+    edited while the run was in flight keeps a timestamp at or after the one
+    stored, so the next run still picks it up. Storing "now" would step over it.
+    """
+    newest = max((stamp for stamp in docs_modified if stamp), default=None)
+    if not newest:
+        return
+    try:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps({"last_modified": newest}, indent=2) + "\n")
+    except OSError as write_error:
+        # A watermark that cannot be written costs a full pull next time, which
+        # is slow but correct. Never fail the run over it.
+        print(f"  ⚠️  Could not write {state_file}: {write_error}")
+
+
 def index_unified_collection(
     documents: List[str],
     metadatas: List[Dict],
     ids: List[str],
     sources_to_update: List[str],
     display=None,
+    incremental_scopes: Optional[Dict[str, List[str]]] = None,
 ):
     """
     Create or update the unified knowledge collection.
@@ -474,6 +587,7 @@ def index_unified_collection(
         Filter,
         FieldCondition,
         MatchAny,
+        MatchValue,
         FilterSelector,
         PointStruct,
     )
@@ -521,17 +635,50 @@ def index_unified_collection(
     else:
         print(f"Using existing '{collection_name}' collection")
 
-        # Delete old chunks from sources being updated using filtered delete
-        if sources_to_update:
-            print(f"Removing old chunks from sources: {', '.join(sources_to_update)}")
+        # Delete old chunks from sources being updated using filtered delete.
+        #
+        # A source that collected INCREMENTALLY must not be wiped wholesale: it
+        # only re-fetched the documents that changed, so a source-wide delete
+        # would drop every document it did not look at this run. Such a source
+        # supplies the document ids it refreshed, and only those are purged --
+        # which still clears the stale chunks of a document whose content
+        # changed, because point ids key off content and the old ones would
+        # otherwise be orphaned.
+        scopes = incremental_scopes or {}
+        full_wipe = [s for s in sources_to_update if s not in scopes]
+        scoped = [s for s in sources_to_update if s in scopes]
+
+        if full_wipe:
+            print(f"Removing old chunks from sources: {', '.join(full_wipe)}")
+            client.delete(
+                collection_name=collection_name,
+                points_selector=FilterSelector(
+                    filter=Filter(
+                        must=[
+                            FieldCondition(key="source", match=MatchAny(any=full_wipe))
+                        ]
+                    )
+                ),
+                wait=True,
+            )
+
+        for source in scoped:
+            doc_ids = scopes[source]
+            if not doc_ids:
+                continue
+            print(
+                f"Removing old chunks from {source}: "
+                f"{len(doc_ids)} refreshed document(s) only"
+            )
             client.delete(
                 collection_name=collection_name,
                 points_selector=FilterSelector(
                     filter=Filter(
                         must=[
                             FieldCondition(
-                                key="source", match=MatchAny(any=sources_to_update)
-                            )
+                                key="source", match=MatchValue(value=source)
+                            ),
+                            FieldCondition(key="doc_id", match=MatchAny(any=doc_ids)),
                         ]
                     )
                 ),
@@ -713,10 +860,16 @@ Examples:
             "jira",
             "slack",
             "slite",
+            "meetings",
             "all",
         ],
         default=["all"],
         help="Which sources to index (default: all)",
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Ignore incremental watermarks and re-fetch every document.",
     )
     parser.add_argument(
         "--matrix",
@@ -740,7 +893,12 @@ Examples:
     index_jira = index_all or "jira" in args.sources
     index_slack = index_all or "slack" in args.sources
     index_slite = index_all or "slite" in args.sources
+    index_meetings = index_all or "meetings" in args.sources
     index_puppet = index_all or "puppet" in args.sources
+
+    # Collect human-actionable failures as we go; surfaced via a macOS
+    # notification at the end of the run since nobody reads the launchd log.
+    run_warnings: List[str] = []
 
     print("Unified RAG Indexer")
     print("=" * 60)
@@ -749,6 +907,95 @@ Examples:
         sources_list = [s for s in args.sources if s != "all"]
         print(f"Indexing sources: {', '.join(sources_list)}")
         print("=" * 60)
+
+    # Validate API credentials before doing any expensive collection work.
+    #
+    # An expired credential does not fail loudly: the affected source collects
+    # zero documents, its existing chunks are preserved (better stale than
+    # empty), and searches keep returning plausible results while the data
+    # silently stops moving. Both the Jira and Slack credentials turned out to
+    # be dead on 2026-08-10, found only by accident. Checking up front folds
+    # them into run_warnings so they reach the same alert as any other failure,
+    # and does it before the ~45 minutes of embedding rather than after.
+    #
+    # Deliberately non-fatal: a dead Slite key is no reason to skip indexing
+    # code and sessions.
+    credential_sources = [
+        name
+        for name, wanted in (
+            ("jira", index_jira),
+            ("slack", index_slack),
+            ("slite", index_slite),
+            ("meetings", index_meetings),
+        )
+        if wanted
+    ]
+    if credential_sources:
+        from check_credentials import (
+            check_sources,
+            format_results,
+            offline,
+            wait_for_network,
+        )
+
+        print()
+
+        # Wait out a missing network before concluding anything about the
+        # credentials. launchd fires at a fixed hour into whatever state the
+        # laptop is in; on 2026-09-10 that was a car with no signal, and all
+        # three API checks failed DNS. Without this the run reports three
+        # expired tokens that were never expired.
+        online = wait_for_network(credential_sources)
+
+        if not online:
+            # Nothing to learn from checking credentials with no route out, so
+            # skip straight to disabling the API sources. Local sources (code,
+            # sessions, sanctum) still index — they never needed the network.
+            print("  ✗ no network after retries — skipping API-backed sources")
+            index_jira = index_slack = index_slite = index_meetings = False
+            run_warnings.append(
+                "No network at run time: "
+                f"{', '.join(sorted(credential_sources))} skipped. Credentials "
+                "were not checked and are probably fine; existing chunks "
+                "preserved. Local sources indexed normally."
+            )
+        else:
+            print("Checking API credentials...")
+            credential_results = check_sources(credential_sources)
+            credential_failures = format_results(credential_results)
+
+            # Skip a source whose credential is already known bad, rather than
+            # letting it make doomed API calls and then report zero items.
+            # Leaving it enabled would also double-report: once here and again
+            # from resolve_sources_to_update's skipped-source list. Its chunks
+            # are preserved either way — the wipe list is built from what
+            # collected.
+            for source, result in credential_results.items():
+                if result.ok:
+                    continue
+                if source == "jira":
+                    index_jira = False
+                elif source == "slack":
+                    index_slack = False
+                elif source == "slite":
+                    index_slite = False
+                elif source == "meetings":
+                    index_meetings = False
+
+            # A source that failed on transport when the network is otherwise
+            # up is a flaky or down API, not a dead token. Say which, so the
+            # alert points at the thing that actually needs doing.
+            transport_only = offline(credential_results)
+            for failure in credential_failures:
+                cause = (
+                    "could not be reached"
+                    if transport_only
+                    else "failed its credential check"
+                )
+                run_warnings.append(
+                    f"{failure} — source {cause}; skipped before indexing, "
+                    "existing chunks preserved"
+                )
 
     # Check dependencies
     try:
@@ -940,6 +1187,11 @@ Examples:
             )
         else:
             print("  ⚠️  No Jira issues collected")
+            run_warnings.append(
+                "Jira: 0 issues collected — the API token may be expired or "
+                "Jira may be unreachable. Check JIRA_API_TOKEN in "
+                "~/.secrets.env. Existing Jira chunks were preserved this run."
+            )
 
     # Source 6: Slack (team conversations via API)
     if index_slack and SLACK_TOKEN_FILE and SLACK_CHANNELS_FILE and SLACK_CHANNELS:
@@ -965,6 +1217,12 @@ Examples:
             )
         else:
             print("  ⚠️  No Slack messages collected")
+            run_warnings.append(
+                "Slack: 0 messages collected — the MCP bridge to the claude.ai "
+                "Slack connector may be failing, or the channel roster at "
+                "config/channels.json may be stale. Existing Slack chunks were "
+                "preserved this run."
+            )
 
     # Source 7: Slite (team knowledge via REST API)
     if index_slite and SLITE_API_KEY and SLITE_ROOT_NOTE_IDS:
@@ -982,6 +1240,62 @@ Examples:
             print(f"  ✓ Collected {len(docs)} Slite notes")
         else:
             print("  ⚠️  No Slite notes collected")
+            run_warnings.append(
+                "Slite: 0 notes collected — likely API rate limiting (429) or "
+                "an expired SLITE_API_KEY in ~/.secrets.env. Existing Slite "
+                "chunks were preserved this run."
+            )
+
+    meetings_refreshed_doc_ids: List[str] = []
+    meetings_modified: List[str] = []
+    if index_meetings and MEETING_DOCS_ENABLED:
+        print("  Collecting meeting docs from Google Drive...")
+        # Fetching a document is ~0.9s (one Docs API call per doc), so a full
+        # pull dominates the run -- 10+ minutes at full corpus size against
+        # ~4 minutes of embedding. The watermark limits the pull to documents
+        # modified since the last successful run. --rebuild ignores it.
+        meetings_state = MEETINGS_STATE_FILE
+        modified_after = None if args.rebuild else _read_watermark(meetings_state)
+        if modified_after:
+            print(f"  (incremental: documents modified after {modified_after})")
+        try:
+            meeting_chunks = collect_drive_meetings(
+                name_contains=MEETING_DOC_QUERY,
+                max_docs=MEETING_MAX_DOCS,
+                modified_after=modified_after,
+            )
+        except DriveAuthError as drive_auth_error:
+            # Credentials are shared with the google-docs MCP server, so a
+            # revoke or re-consent there lands here. Surface it and carry on:
+            # resolve_sources_to_update leaves the existing chunks alone when a
+            # source collects nothing.
+            print(f"  ⚠️  Meeting docs skipped -- {drive_auth_error}")
+            run_warnings.append(
+                f"Meetings: {drive_auth_error} Existing meeting chunks were "
+                "preserved this run."
+            )
+            meeting_chunks = []
+
+        if meeting_chunks:
+            docs, metas, ids = load_meeting_docs(meeting_chunks)
+            all_documents.extend(docs)
+            all_metadatas.extend(metas)
+            all_ids.extend(ids)
+            # Only the documents refreshed this run may be purged; everything
+            # else in source=meetings must survive an incremental pull.
+            meetings_refreshed_doc_ids = sorted(
+                {m["doc_id"] for m in metas if m.get("doc_id")}
+            )
+            meetings_modified = [m.get("modified_at", "") for m in metas]
+            print(f"  ✓ Collected {len(docs)} meeting chunks")
+        else:
+            print("  ⚠️  No meeting chunks collected")
+            run_warnings.append(
+                "Meetings: 0 chunks collected — Drive returned no matching "
+                f"docs for {MEETING_DOC_QUERY!r}, or the shared google-docs "
+                "MCP credential was revoked. Existing meeting chunks were "
+                "preserved this run."
+            )
 
     # Future sources:
     # process_files = collect_process_docs()
@@ -1014,6 +1328,8 @@ Examples:
         requested_sources.append("slite")
     if index_puppet:
         requested_sources.append("puppet")
+    if index_meetings:
+        requested_sources.append("meetings")
 
     # Only wipe-and-replace sources that actually produced chunks this run;
     # preserve (don't wipe) any requested source that collected 0 chunks. See
@@ -1022,12 +1338,33 @@ Examples:
         all_metadatas, requested_sources
     )
     if skipped_sources:
-        print(
-            "⚠️  Collected 0 chunks for requested source(s): "
+        message = (
+            "Collected 0 chunks for requested source(s): "
             f"{', '.join(skipped_sources)} — leaving their existing chunks in "
             "place (NOT wiping). Investigate the collector before trusting the "
             "next run."
         )
+        print(f"⚠️  {message}")
+        # Route the guardrail's own finding into the alert path. Printing it is
+        # what let the archived-slack-tools breakage run unnoticed: the wipe was
+        # correctly skipped, but the message went to a launchd log nobody reads.
+        # A source that collects nothing is exactly the silent failure the
+        # modal exists for.
+        if not any(
+            source in warning for warning in run_warnings for source in skipped_sources
+        ):
+            run_warnings.append(message)
+
+    # Meetings pulled incrementally: scope its purge to the refreshed documents.
+    # A full pull (--rebuild, or a first run with no watermark) leaves the scope
+    # empty so the source is wiped and replaced wholesale, as before.
+    incremental_scopes = {}
+    if (
+        meetings_refreshed_doc_ids
+        and not args.rebuild
+        and _read_watermark(MEETINGS_STATE_FILE)
+    ):
+        incremental_scopes["meetings"] = meetings_refreshed_doc_ids
 
     # Index (optionally wrapped in a Matrix-rain live display).
     import contextlib
@@ -1054,6 +1391,7 @@ Examples:
                 all_ids,
                 sources_being_updated,
                 display=display,
+                incremental_scopes=incremental_scopes,
             )
             count_result = client.count(collection_name="unified_knowledge", exact=True)
         # After the matrix context exits the terminal is restored; print the
@@ -1063,15 +1401,53 @@ Examples:
         print("\nCollection 'unified_knowledge' ready for querying")
     else:
         client, index_time = index_unified_collection(
-            all_documents, all_metadatas, all_ids, sources_being_updated
+            all_documents,
+            all_metadatas,
+            all_ids,
+            sources_being_updated,
+            incremental_scopes=incremental_scopes,
         )
         count_result = client.count(collection_name="unified_knowledge", exact=True)
         print(f"✓ Collection now contains {count_result.count} total chunks")
         print_index_summary(all_metadatas, index_time)
         print("\nCollection 'unified_knowledge' ready for querying")
 
+    if meetings_modified and "meetings" in sources_being_updated:
+        _write_watermark(MEETINGS_STATE_FILE, meetings_modified)
+
+    # Surface any human-actionable failures out-of-band. The run still
+    # "succeeds" (other sources indexed fine), but the user needs to know a
+    # source silently dropped out so they can act on it.
+    if run_warnings:
+        for warning in run_warnings:
+            print(f"\n⚠️  {warning}")
+        summary = f"{len(run_warnings)} source(s) failed to ingest. " + run_warnings[0]
+        notify_macos("RAG indexer: source ingestion failed", summary)
+
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # The notify_macos() call inside main() only covers a source failing to
+    # ingest during a run that otherwise finished. A crash never reached it:
+    # Qdrant unreachable, disk full, a bad import — the run died here with a
+    # stack trace in a log file nobody reads, so the unattended 8am launchd job
+    # failed silently every morning for weeks (exit status 1, no modal, and the
+    # index quietly went stale). Any unhandled exception now pops the same
+    # modal the ingest warnings do.
+    #
+    # Catching Exception rather than BaseException is deliberate: SystemExit
+    # (the normal return path) and KeyboardInterrupt (Ctrl-C on a manual run)
+    # must pass through without popping a dialog.
+    try:
+        sys.exit(main())
+    except Exception as crash:
+        traceback.print_exc()
+        detail = f"{type(crash).__name__}: {crash}"
+        if len(detail) > 300:
+            detail = detail[:297] + "..."
+        notify_macos(
+            "RAG indexer: run failed — index NOT updated",
+            f"{detail}\n\nFull traceback: " "~/Library/Logs/bamboohr-rag-indexer.log",
+        )
+        sys.exit(1)

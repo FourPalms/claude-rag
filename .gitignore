@@ -40,3 +40,4 @@ logs/
 
 # Slack tokens (stealth backend only; never commit real tokens)
 config/tokens.json
+config/meetings_last_checked.json
