@@ -15,6 +15,18 @@
 #      cannot report on itself. Without the notify below, a hung-then-killed run
 #      would be exactly as silent as the hang it replaced.
 #
+#   3. An alert on ANY non-zero exit. The indexer's own notifications cover a
+#      run that finished, and its crash handler covers an unhandled exception.
+#      Neither covers a run that declined to start: main() returns early — and
+#      silently — when tree-sitter is missing, when a code repo has uncommitted
+#      changes, or when no source collected anything. On 2026-09-11 the 6am run
+#      refused over a dirty repo, wrote its reason to this log, exited 2, and
+#      said nothing; the index simply did not update that day and nobody knew
+#      until asked. Checking the exit code here covers all three at once, plus
+#      any early return added later, plus the failures Python cannot report on
+#      itself: an import error before the crash handler is installed, a SIGKILL,
+#      an OOM kill, an interpreter that never starts.
+#
 # Timeout budget: a full index of all sources measured ~46 minutes on
 # 2026-08-10. 2 hours leaves generous headroom while still bounding a hang to
 # well under the 24-hour gap between runs.
@@ -36,28 +48,44 @@ if [ ! -x "$TIMEOUT_BIN" ]; then
 	# to prevent.
 	echo "WARNING: $TIMEOUT_BIN not found; running without a wall-clock cap."
 	"$PYTHON_BIN" -u scripts/unified_indexer.py "$@"
-	exit $?
+	rc=$?
+else
+	# -k: if the run ignores TERM at the cap, follow up with KILL after the
+	# grace. Any arguments given to this wrapper are forwarded to the indexer,
+	# which is how the plist selects which sources to index.
+	#
+	# -u so a run killed at the cap doesn't lose its unflushed tail: launchd
+	# redirects stdout to a file, which makes Python block-buffer it.
+	"$TIMEOUT_BIN" -k "$GRACE_SECONDS" "$MAX_SECONDS" "$PYTHON_BIN" -u scripts/unified_indexer.py "$@"
+	rc=$?
 fi
 
-# -k: if the run ignores TERM at the cap, follow up with KILL after the grace.
-# Any arguments given to this wrapper are forwarded to the indexer, which is how
-# the plist selects which sources to index.
-#
-# -u so a run killed at the cap doesn't lose its unflushed tail: launchd
-# redirects stdout to a file, which makes Python block-buffer it.
-"$TIMEOUT_BIN" -k "$GRACE_SECONDS" "$MAX_SECONDS" "$PYTHON_BIN" -u scripts/unified_indexer.py "$@"
-rc=$?
+notify() {
+	# Backgrounded and output-suppressed so a failed or unavailable osascript
+	# can never change the wrapper's exit code or block the run from ending.
+	osascript -e "display dialog \"$2
+
+Log: ~/Library/Logs/bamboohr-rag-indexer.log\" with title \"$1\" buttons {\"OK\"} default button \"OK\" with icon caution" >/dev/null 2>&1 &
+}
 
 # 124 is timeout(1)'s signal that it killed the child at the cap.
 if [ "$rc" -eq 124 ]; then
 	echo "ERROR: indexer exceeded ${MAX_SECONDS}s and was killed."
 	# Report the cap that actually tripped rather than a hardcoded figure, so
 	# the alert stays truthful when MAX_SECONDS is overridden.
-	osascript -e "display dialog \"The daily RAG index hung and was killed after ${MAX_SECONDS}s. The index was NOT updated.
+	notify "RAG indexer: run timed out" \
+		"The daily RAG index hung and was killed after ${MAX_SECONDS}s. The index was NOT updated.
 
-Most likely a stalled API connection (Jira / Slack / Slite).
+Most likely a stalled API connection (Jira / Slack / Slite)."
+elif [ "$rc" -ne 0 ]; then
+	# Everything else non-zero. The indexer prints its reason to this log
+	# before returning, so the log is where the answer is; the point of this
+	# alert is only that the day's index did not happen at all.
+	echo "ERROR: indexer exited $rc without indexing."
+	notify "RAG indexer: run did not complete — index NOT updated" \
+		"The daily RAG index exited with code $rc. The index was NOT updated.
 
-Log: ~/Library/Logs/bamboohr-rag-indexer.log\" with title \"RAG indexer: run timed out\" buttons {\"OK\"} default button \"OK\" with icon caution" >/dev/null 2>&1 &
+Common causes: uncommitted changes in a code repo (exit 2), a broken tree-sitter install, or no documents collected."
 fi
 
 exit $rc
